@@ -593,9 +593,16 @@ esp_err_t box2_lcd_render_racing(const box2_game_frame_t *game)
         draw_center_panel(53, 157);
         draw_text(38, 69, "NEON", 4, rgb565(45, 221, 255));
         draw_text(50, 105, "RUSH", 4, rgb565(255, 52, 102));
-        draw_text(54, 148, "TILT TO STEER", 1, rgb565(235, 239, 246));
-        draw_text(42, 166, "M  START RACE", 1, rgb565(255, 215, 77));
-        draw_text(30, 183, "L/R VOLUME  Q RESET", 1, rgb565(147, 168, 194));
+        if (game->steering_ready) {
+            snprintf(text, sizeof(text), "STEERING %c READY", "XYZ"[game->steering_axis]);
+            draw_text(48, 148, text, 1, rgb565(68, 236, 142));
+            draw_text(42, 166, "M  START RACE", 1, rgb565(255, 215, 77));
+            draw_text(30, 183, "L/R VOLUME  Q RESET", 1, rgb565(147, 168, 194));
+        } else {
+            draw_text(39, 148, "TILT LEFT TO SET", 1, rgb565(255, 215, 77));
+            draw_text(33, 166, "HOLD NORMAL FIRST", 1, rgb565(235, 239, 246));
+            draw_text(30, 183, "AUTO AXIS CALIBRATION", 1, rgb565(147, 168, 194));
+        }
     } else if (game->screen == BOX2_GAME_COUNTDOWN) {
         fill_circle(120, 143, 43, rgb565(5, 9, 22));
         fill_circle(120, 143, 38, rgb565(232, 42, 83));

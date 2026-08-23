@@ -1,6 +1,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include "box2_audio.h"
 #include "box2_board.h"
@@ -22,6 +23,10 @@ typedef struct {
     int invulnerable_ms;
     int center_x_mg;
     int center_y_mg;
+    int center_z_mg;
+    int steering_axis;
+    int steering_sign;
+    float filtered_steer_mg;
     uint32_t random;
     TickType_t countdown_started;
 } race_game_t;
@@ -59,6 +64,8 @@ static void start_race(race_game_t *game, TickType_t now)
     int best = game->view.best_score;
     int volume = game->view.volume;
     int tilt = game->view.tilt_mg;
+    bool steering_ready = game->view.steering_ready;
+    int steering_axis = game->view.steering_axis;
     memset(&game->view, 0, sizeof(game->view));
     game->view.screen = BOX2_GAME_COUNTDOWN;
     game->view.countdown = 3;
@@ -66,6 +73,8 @@ static void start_race(race_game_t *game, TickType_t now)
     game->view.volume = volume;
     game->view.best_score = best;
     game->view.tilt_mg = tilt;
+    game->view.steering_ready = steering_ready;
+    game->view.steering_axis = steering_axis;
     game->distance_exact = 0.0f;
     game->lateral_velocity = 0.0f;
     game->curve_target = 0.0f;
@@ -121,16 +130,30 @@ static void update_traffic(race_game_t *game, float dt)
 static void update_running(race_game_t *game, const box2_motion_state_t *motion,
                            float dt)
 {
-    int steer_mg = motion->x_mg - game->center_x_mg;
-    int throttle_mg = motion->y_mg - game->center_y_mg;
+    const int delta[3] = {
+        motion->x_mg - game->center_x_mg,
+        motion->y_mg - game->center_y_mg,
+        motion->z_mg - game->center_z_mg,
+    };
+    int raw_steer_mg = delta[game->steering_axis] * game->steering_sign;
+    game->filtered_steer_mg += (raw_steer_mg - game->filtered_steer_mg) *
+                               clampf(dt * 9.0f, 0.0f, 1.0f);
+    int steer_mg = (int)game->filtered_steer_mg;
+    int throttle_axis = game->steering_axis == 1 ? 0 : 1;
+    int throttle_mg = delta[throttle_axis];
+    int steering_after_deadzone = steer_mg;
+    if (steering_after_deadzone > 45) steering_after_deadzone -= 45;
+    else if (steering_after_deadzone < -45) steering_after_deadzone += 45;
+    else steering_after_deadzone = 0;
     game->view.tilt_mg = steer_mg;
-    float steering = clampf(steer_mg / 520.0f, -1.0f, 1.0f);
+    float steering = clampf(steering_after_deadzone / 300.0f, -1.0f, 1.0f);
     float target_speed = 142.0f - throttle_mg * 0.11f;
     target_speed = clampf(target_speed, 72.0f, 224.0f);
     if (fabsf(game->view.player_x) > 0.84f) target_speed *= 0.48f;
     game->view.speed_kmh += (target_speed - game->view.speed_kmh) * dt * 1.7f;
-    game->lateral_velocity += steering * dt * 4.4f;
-    game->lateral_velocity *= 1.0f - clampf(dt * 3.6f, 0.0f, 0.9f);
+    float target_lateral_velocity = steering * 1.85f;
+    game->lateral_velocity += (target_lateral_velocity - game->lateral_velocity) *
+                              clampf(dt * 7.5f, 0.0f, 1.0f);
     game->view.player_x += game->lateral_velocity * dt;
     if (game->view.player_x < -1.05f) {
         game->view.player_x = -1.05f;
@@ -179,11 +202,13 @@ static void calibrate_motion(race_game_t *game, box2_motion_state_t *motion)
 {
     int64_t sum_x = 0;
     int64_t sum_y = 0;
+    int64_t sum_z = 0;
     int samples = 0;
     for (int i = 0; i < 48; ++i) {
         if (box2_motion_read(motion) == ESP_OK) {
             sum_x += motion->x_mg;
             sum_y += motion->y_mg;
+            sum_z += motion->z_mg;
             ++samples;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -191,9 +216,37 @@ static void calibrate_motion(race_game_t *game, box2_motion_state_t *motion)
     if (samples > 0) {
         game->center_x_mg = (int)(sum_x / samples);
         game->center_y_mg = (int)(sum_y / samples);
+        game->center_z_mg = (int)(sum_z / samples);
     }
-    ESP_LOGI(TAG, "tilt center calibrated: x=%d mg y=%d mg",
-             game->center_x_mg, game->center_y_mg);
+    ESP_LOGI(TAG, "tilt center calibrated: x=%d y=%d z=%d mg",
+             game->center_x_mg, game->center_y_mg, game->center_z_mg);
+}
+
+static void detect_steering_axis(race_game_t *game, const box2_motion_state_t *motion)
+{
+    if (game->view.steering_ready) return;
+    const int delta[3] = {
+        motion->x_mg - game->center_x_mg,
+        motion->y_mg - game->center_y_mg,
+        motion->z_mg - game->center_z_mg,
+    };
+    int axis = 0;
+    int magnitude = abs(delta[0]);
+    for (int i = 1; i < 3; ++i) {
+        if (abs(delta[i]) > magnitude) {
+            axis = i;
+            magnitude = abs(delta[i]);
+        }
+    }
+    if (magnitude < 150) return;
+    game->steering_axis = axis;
+    game->steering_sign = delta[axis] > 0 ? -1 : 1;
+    game->filtered_steer_mg = 0.0f;
+    game->view.steering_axis = axis;
+    game->view.steering_ready = true;
+    ESP_LOGI(TAG, "steering calibrated from LEFT tilt: axis=%c sign=%d delta=%d mg",
+             "XYZ"[axis], game->steering_sign, delta[axis]);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_START));
 }
 
 void app_main(void)
@@ -236,6 +289,9 @@ void app_main(void)
             continue;
         }
         if (box2_motion_read(&motion) != ESP_OK) motion.detected = false;
+        if (game.view.screen == BOX2_GAME_TITLE && motion.detected) {
+            detect_steering_axis(&game, &motion);
+        }
         bool left_edge = keys.left_pressed && !previous.left_pressed;
         bool right_edge = keys.right_pressed && !previous.right_pressed;
         bool middle_edge = keys.middle_pressed && !previous.middle_pressed;
@@ -244,9 +300,12 @@ void app_main(void)
 
         if (left_edge) set_volume(&game, game.view.volume - 10);
         if (right_edge) set_volume(&game, game.view.volume + 10);
-        if (q_edge) start_race(&game, now);
+        if (q_edge && game.view.steering_ready) start_race(&game, now);
         if (middle_edge) {
-            if (game.view.screen == BOX2_GAME_TITLE || game.view.screen == BOX2_GAME_OVER) {
+            if (game.view.screen == BOX2_GAME_TITLE && !game.view.steering_ready) {
+                ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_MENU));
+            } else if (game.view.screen == BOX2_GAME_TITLE ||
+                       game.view.screen == BOX2_GAME_OVER) {
                 start_race(&game, now);
             } else if (game.view.screen == BOX2_GAME_RUNNING) {
                 game.view.screen = BOX2_GAME_PAUSED;
