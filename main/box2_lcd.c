@@ -594,11 +594,9 @@ esp_err_t box2_lcd_render_racing(const box2_game_frame_t *game)
         draw_text(38, 69, "NEON", 4, rgb565(45, 221, 255));
         draw_text(50, 105, "RUSH", 4, rgb565(255, 52, 102));
         if (game->steering_ready) {
-            snprintf(text, sizeof(text), "STEERING %c%c READY", "XYZ"[game->steering_axis],
-                     game->steering_sign >= 0 ? '+' : '-');
-            draw_text(42, 148, text, 1, rgb565(68, 236, 142));
+            draw_text(45, 148, "STEERING Y FIXED", 1, rgb565(68, 236, 142));
             draw_text(42, 166, "M  START RACE", 1, rgb565(255, 215, 77));
-            draw_text(21, 183, "Q AXIS  L/R VOLUME", 1, rgb565(147, 168, 194));
+            draw_text(30, 183, "L/R VOLUME  Q RESET", 1, rgb565(147, 168, 194));
         } else {
             draw_text(39, 148, "TILT LEFT TO SET", 1, rgb565(255, 215, 77));
             draw_text(33, 166, "HOLD NORMAL FIRST", 1, rgb565(235, 239, 246));

@@ -221,27 +221,12 @@ static void calibrate_motion(race_game_t *game, box2_motion_state_t *motion)
     }
     ESP_LOGI(TAG, "tilt center calibrated: x=%d y=%d z=%d mg",
              game->center_x_mg, game->center_y_mg, game->center_z_mg);
-    game->steering_axis = 0;
+    game->steering_axis = 1;
     game->steering_sign = 1;
-    game->view.steering_axis = 0;
+    game->view.steering_axis = 1;
     game->view.steering_sign = 1;
     game->view.steering_ready = true;
-    ESP_LOGI(TAG, "steering defaults to screen horizontal axis X+");
-}
-
-static void cycle_steering_axis(race_game_t *game)
-{
-    int mode = game->steering_axis * 2 + (game->steering_sign < 0 ? 1 : 0);
-    mode = (mode + 1) % 6;
-    game->steering_axis = mode / 2;
-    game->steering_sign = (mode & 1) ? -1 : 1;
-    game->filtered_steer_mg = 0.0f;
-    game->view.steering_axis = game->steering_axis;
-    game->view.steering_sign = game->steering_sign;
-    game->view.steering_ready = true;
-    ESP_LOGI(TAG, "steering selection: %c%c", "XYZ"[game->steering_axis],
-             game->steering_sign > 0 ? '+' : '-');
-    ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_MENU));
+    ESP_LOGI(TAG, "steering fixed to BOX2 screen horizontal axis Y+");
 }
 
 void app_main(void)
@@ -293,8 +278,7 @@ void app_main(void)
         if (left_edge) set_volume(&game, game.view.volume - 10);
         if (right_edge) set_volume(&game, game.view.volume + 10);
         if (q_edge) {
-            if (game.view.screen == BOX2_GAME_TITLE) cycle_steering_axis(&game);
-            else start_race(&game, now);
+            start_race(&game, now);
         }
         if (middle_edge) {
             if (game.view.screen == BOX2_GAME_TITLE && !game.view.steering_ready) {
