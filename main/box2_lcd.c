@@ -145,6 +145,36 @@ static void fill_circle(int cx, int cy, int radius, uint16_t color)
     }
 }
 
+static void fill_ellipse(int cx, int cy, int radius_x, int radius_y, uint16_t color)
+{
+    if (radius_x <= 0 || radius_y <= 0) return;
+    for (int y = -radius_y; y <= radius_y; ++y) {
+        int x = radius_x;
+        while (x > 0 && x * x * radius_y * radius_y +
+                            y * y * radius_x * radius_x >
+                        radius_x * radius_x * radius_y * radius_y) {
+            --x;
+        }
+        fill_rect(cx - x, cy + y, x * 2 + 1, 1, color);
+    }
+}
+
+static void draw_line(int x0, int y0, int x1, int y1, int thickness, uint16_t color)
+{
+    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = -(y1 > y0 ? y1 - y0 : y0 - y1);
+    int sy = y0 < y1 ? 1 : -1;
+    int error = dx + dy;
+    while (true) {
+        fill_rect(x0 - thickness / 2, y0 - thickness / 2, thickness, thickness, color);
+        if (x0 == x1 && y0 == y1) break;
+        int twice = error * 2;
+        if (twice >= dy) { error += dy; x0 += sx; }
+        if (twice <= dx) { error += dx; y0 += sy; }
+    }
+}
+
 static void fill_triangle(int x0, int y0, int x1, int y1, int x2, int y2,
                           uint16_t color)
 {
@@ -439,6 +469,107 @@ static void draw_tree(int x, int y, int size)
     fill_circle(x + size / 8, y - size / 3, size / 4, rgb565(52, 151, 70));
 }
 
+static void draw_cloud(int x, int y, int scale)
+{
+    uint16_t shadow = rgb565(92, 70, 116);
+    uint16_t light = rgb565(191, 134, 158);
+    fill_ellipse(x, y + scale / 3, scale * 2, scale / 2, shadow);
+    fill_circle(x - scale, y, scale, light);
+    fill_circle(x, y - scale / 3, scale + scale / 3, light);
+    fill_circle(x + scale, y, scale * 3 / 4, light);
+}
+
+static void draw_city_silhouette(void)
+{
+    static const uint8_t widths[] = {13, 9, 17, 11, 15, 8, 18, 12, 14, 10, 16, 9, 15, 12};
+    static const uint8_t heights[] = {15, 25, 19, 31, 22, 14, 28, 18, 33, 21, 26, 17, 29, 20};
+    int x = -3;
+    for (size_t i = 0; i < sizeof(widths); ++i) {
+        int width = widths[i];
+        int height = heights[i];
+        int top = 92 - height;
+        fill_rect(x, top, width, height, rgb565(18, 22, 42));
+        fill_rect(x + 2, top + 2, width - 4, 2, rgb565(31, 33, 58));
+        for (int wy = top + 6; wy < 89; wy += 7) {
+            for (int wx = x + 3; wx < x + width - 2; wx += 6) {
+                if (((wx + wy + (int)i) & 3) != 0) {
+                    fill_rect(wx, wy, 2, 2,
+                              ((wx + wy) & 1) ? rgb565(255, 174, 77) :
+                                                rgb565(62, 190, 222));
+                }
+            }
+        }
+        if ((i % 4) == 1) fill_rect(x + width / 2, top - 6, 1, 6, rgb565(44, 47, 73));
+        x += width + 2;
+    }
+}
+
+static void draw_guardrails(const box2_game_frame_t *game)
+{
+    int previous_y = 0;
+    int previous_left = 0;
+    int previous_right = 0;
+    bool have_previous = false;
+    for (int i = 1; i <= 10; ++i) {
+        float depth = i / 10.0f;
+        int y, center, half;
+        project_road(depth, game->curve, &y, &center, &half);
+        int left = center - half - 8;
+        int right = center + half + 8;
+        int post_height = 2 + (int)(depth * 12.0f);
+        int thickness = depth > 0.72f ? 2 : 1;
+        uint16_t post = rgb565(104, 118, 139);
+        uint16_t rail = rgb565(206, 220, 228);
+        fill_rect(left - thickness, y - post_height, thickness + 1, post_height, post);
+        fill_rect(right, y - post_height, thickness + 1, post_height, post);
+        if (have_previous) {
+            draw_line(previous_left, previous_y - 2, left, y - post_height / 2,
+                      thickness, rail);
+            draw_line(previous_right, previous_y - 2, right, y - post_height / 2,
+                      thickness, rail);
+        }
+        previous_y = y;
+        previous_left = left;
+        previous_right = right;
+        have_previous = true;
+    }
+}
+
+static void draw_roadside_lights(const box2_game_frame_t *game)
+{
+    for (int i = 0; i < 5; ++i) {
+        float depth = i / 5.0f + game->road_phase * 0.72f;
+        depth -= (int)depth;
+        if (depth < 0.14f) continue;
+        int y, center, half;
+        project_road(depth, game->curve, &y, &center, &half);
+        int pole_height = 4 + (int)(depth * 35.0f);
+        int offset = 13 + (int)(depth * 8.0f);
+        int left = center - half - offset;
+        int right = center + half + offset;
+        int thickness = depth > 0.62f ? 2 : 1;
+        draw_line(left, y, left, y - pole_height, thickness, rgb565(54, 65, 79));
+        draw_line(right, y, right, y - pole_height, thickness, rgb565(54, 65, 79));
+        int glow = 1 + (int)(depth * 4.0f);
+        fill_circle(left, y - pole_height, glow + 2, rgb565(35, 84, 99));
+        fill_circle(right, y - pole_height, glow + 2, rgb565(82, 47, 83));
+        fill_circle(left, y - pole_height, glow, rgb565(103, 239, 255));
+        fill_circle(right, y - pole_height, glow, rgb565(255, 83, 159));
+    }
+}
+
+static void draw_speed_streaks(const box2_game_frame_t *game)
+{
+    if (game->screen != BOX2_GAME_RUNNING || game->speed_kmh < 75.0f) return;
+    int length = 3 + (int)((game->speed_kmh - 70.0f) / 18.0f);
+    for (int i = 0; i < 8; ++i) {
+        int y = 112 + ((i * 37 + (int)(game->road_phase * 240.0f)) % 182);
+        int x = (i & 1) ? 8 + (i * 13) % 38 : 194 + (i * 11) % 34;
+        uint16_t color = (i & 1) ? rgb565(100, 225, 255) : rgb565(255, 99, 174);
+        draw_line(x, y, x + ((i & 1) ? -2 : 2), y + length, 1, color);
+    }
+}
+
 static void draw_car(int center_x, int bottom_y, int width, uint8_t palette, bool player)
 {
     static const uint8_t colors[][3] = {
@@ -449,14 +580,19 @@ static void draw_car(int center_x, int bottom_y, int width, uint8_t palette, boo
     int height = width * (player ? 13 : 12) / 9;
     int left = center_x - width / 2;
     int top = bottom_y - height;
-    fill_rect(left - 2, bottom_y - height / 5, width + 4, height / 5,
-              rgb565(7, 10, 18));
+    fill_ellipse(center_x + 2, bottom_y - 1, width * 3 / 5, height / 7,
+                 rgb565(5, 7, 13));
     fill_rect(left - width / 9, top + height / 3, width / 5, height * 3 / 5,
               rgb565(8, 9, 14));
     fill_rect(left + width - width / 9, top + height / 3, width / 5, height * 3 / 5,
               rgb565(8, 9, 14));
+    fill_quad(left + width / 4 - 2, left + width * 3 / 4 + 2, top - 1,
+              left - 2, left + width + 2, bottom_y, rgb565(12, 15, 23));
     fill_quad(left + width / 4, left + width * 3 / 4, top,
               left, left + width, bottom_y, rgb565(c[0], c[1], c[2]));
+    fill_quad(left + width / 4, left + width / 3, top + height / 8,
+              left + width / 12, left + width / 4, bottom_y - height / 7,
+              rgb565(c[0] / 2, c[1] / 2, c[2] / 2));
     fill_quad(left + width / 3, left + width * 2 / 3, top + height / 7,
               left + width / 5, left + width * 4 / 5, top + height / 2,
               rgb565(20, 49, 73));
@@ -464,34 +600,58 @@ static void draw_car(int center_x, int bottom_y, int width, uint8_t palette, boo
               left + width / 4, left + width * 3 / 4, top + height / 3,
               rgb565(72, 156, 188));
     fill_rect(left + width / 8, bottom_y - height / 4, width / 5, height / 10 + 1,
-              rgb565(255, 238, 150));
+              rgb565(255, 35, 61));
     fill_rect(left + width * 27 / 40, bottom_y - height / 4, width / 5,
-              height / 10 + 1, rgb565(255, 238, 150));
+              height / 10 + 1, rgb565(255, 35, 61));
+    fill_rect(left + width / 7, bottom_y - height / 4 + 1, width / 9 + 1, 1,
+              rgb565(255, 187, 162));
+    fill_rect(left + width * 3 / 4, bottom_y - height / 4 + 1, width / 9 + 1, 1,
+              rgb565(255, 187, 162));
     fill_rect(center_x - width / 16, top + 2, width / 8 + 1, height * 4 / 5,
               rgb565(255, 245, 245));
+    fill_rect(center_x - width / 7, bottom_y - height / 9, width * 2 / 7, 2,
+              rgb565(220, 225, 220));
     if (player) {
-        fill_rect(left + 2, bottom_y - 4, width - 4, 3, rgb565(130, 10, 25));
-        fill_rect(left + width / 4, bottom_y - height / 12, width / 2, 2,
-                  rgb565(255, 80, 45));
+        fill_rect(left - 3, top + height / 8, width + 6, 3, rgb565(16, 18, 27));
+        fill_rect(left, top + height / 8 - 2, 3, 5, rgb565(28, 31, 42));
+        fill_rect(left + width - 3, top + height / 8 - 2, 3, 5, rgb565(28, 31, 42));
+        fill_rect(left + 2, bottom_y - 4, width - 4, 3, rgb565(103, 8, 23));
+        fill_circle(left + width / 5, bottom_y + 1, 3, rgb565(255, 87, 24));
+        fill_circle(left + width * 4 / 5, bottom_y + 1, 3, rgb565(255, 87, 24));
+        fill_circle(left + width / 5, bottom_y + 1, 1, rgb565(255, 236, 106));
+        fill_circle(left + width * 4 / 5, bottom_y + 1, 1, rgb565(255, 236, 106));
     }
 }
 
 static void draw_race_world(const box2_game_frame_t *game)
 {
     for (int y = 0; y < 92; ++y) {
-        uint8_t r = (uint8_t)(8 + y * 31 / 92);
-        uint8_t g = (uint8_t)(20 + y * 69 / 92);
-        uint8_t b = (uint8_t)(54 + y * 91 / 92);
+        uint8_t r = (uint8_t)(7 + y * 112 / 92);
+        uint8_t g = (uint8_t)(10 + y * 55 / 92);
+        uint8_t b = (uint8_t)(38 + y * 74 / 92);
         fill_rect(0, y, BOX2_LCD_WIDTH, 1, rgb565(r, g, b));
     }
-    fill_circle(190, 46, 22, rgb565(255, 101, 63));
-    fill_circle(190, 46, 15, rgb565(255, 187, 84));
+    static const uint8_t stars[][2] = {
+        {15,38}, {31,54}, {53,33}, {76,46}, {103,36}, {128,52}, {151,31}, {219,39},
+    };
+    for (size_t i = 0; i < sizeof(stars) / sizeof(stars[0]); ++i) {
+        fill_rect(stars[i][0], stars[i][1], (i & 1) + 1, (i & 1) + 1,
+                  rgb565(222, 211, 224));
+    }
+    fill_circle(190, 49, 29, rgb565(170, 66, 93));
+    fill_circle(190, 49, 23, rgb565(246, 101, 76));
+    fill_circle(190, 49, 16, rgb565(255, 205, 107));
+    fill_rect(169, 44, 43, 2, rgb565(205, 75, 88));
+    fill_rect(164, 53, 52, 2, rgb565(189, 69, 89));
+    draw_cloud(45, 54, 7);
+    draw_cloud(132, 68, 5);
     fill_triangle(-35, 92, 35, 38, 105, 92, rgb565(29, 48, 73));
     fill_triangle(35, 92, 98, 51, 155, 92, rgb565(40, 61, 82));
     fill_triangle(113, 92, 166, 57, 231, 92, rgb565(28, 51, 71));
     fill_triangle(185, 92, 229, 62, 273, 92, rgb565(48, 66, 82));
     fill_triangle(10, 58, 35, 38, 59, 60, rgb565(181, 201, 210));
     fill_triangle(79, 63, 98, 51, 119, 66, rgb565(166, 190, 204));
+    draw_city_silhouette();
 
     const int horizon = 91;
     for (int y = horizon; y < BOX2_LCD_HEIGHT; ++y) {
@@ -505,6 +665,11 @@ static void draw_race_world(const box2_game_frame_t *game)
                   band ? rgb565(243, 236, 218) : rgb565(227, 48, 56));
         fill_rect(center - half, y, half * 2, 1,
                   band ? rgb565(47, 50, 58) : rgb565(43, 46, 53));
+        if (y > horizon + 18 && (y & 3) == 0) {
+            int texture = ((y * 37 + (int)(game->road_phase * 173.0f)) %
+                           (half * 2 - 4)) - half + 2;
+            fill_rect(center + texture, y, 1 + (y > 250), 1, rgb565(61, 63, 68));
+        }
     }
 
     for (int marker = 0; marker < 8; ++marker) {
@@ -524,6 +689,8 @@ static void draw_race_world(const box2_game_frame_t *game)
         }
     }
 
+    draw_guardrails(game);
+
     for (int i = 0; i < 6; ++i) {
         float d = (float)i / 6.0f + game->road_phase * 0.75f;
         d -= (int)d;
@@ -534,6 +701,8 @@ static void draw_race_world(const box2_game_frame_t *game)
         draw_tree(center - half - 12 - (i & 1) * 13, y - size / 2, size);
         if ((i & 1) == 0) draw_tree(center + half + 18, y - size / 2, size);
     }
+    draw_roadside_lights(game);
+    draw_speed_streaks(game);
 
     for (int i = 0; i < BOX2_GAME_TRAFFIC_MAX; ++i) {
         if (!game->traffic[i].active) continue;
@@ -545,40 +714,52 @@ static void draw_race_world(const box2_game_frame_t *game)
     }
 
     int player_x = 120 + (int)(game->player_x * 72.0f) + (int)(game->curve * 17.0f);
-    fill_circle(player_x, 305, 27, rgb565(30, 31, 38));
+    fill_ellipse(player_x + 3, 306, 30, 9, rgb565(19, 21, 29));
     draw_car(player_x, 314, 39, 0, true);
 }
 
 static void draw_hud(const box2_game_frame_t *game)
 {
     char text[32];
-    fill_rect(0, 0, BOX2_LCD_WIDTH, 29, rgb565(4, 9, 22));
-    fill_rect(0, 28, BOX2_LCD_WIDTH, 2, rgb565(29, 203, 241));
-    snprintf(text, sizeof(text), "%03d KMH", (int)game->speed_kmh);
-    draw_text(6, 6, text, 1, rgb565(80, 229, 255));
+    fill_rect(0, 0, BOX2_LCD_WIDTH, 38, rgb565(3, 7, 18));
+    fill_rect(0, 0, 68, 3, rgb565(42, 218, 255));
+    fill_rect(172, 0, 68, 3, rgb565(255, 51, 113));
+    fill_rect(0, 36, BOX2_LCD_WIDTH, 2, rgb565(25, 91, 120));
+    fill_rect(3, 4, 66, 29, rgb565(8, 22, 38));
+    fill_rect(75, 4, 99, 29, rgb565(10, 14, 29));
+    fill_rect(180, 4, 57, 29, rgb565(24, 13, 31));
+    snprintf(text, sizeof(text), "%03d", (int)game->speed_kmh);
+    draw_text(7, 7, text, 2, rgb565(80, 229, 255));
+    draw_text(45, 16, "KMH", 1, rgb565(121, 159, 177));
     snprintf(text, sizeof(text), "SCORE %05d", game->score);
-    draw_text(91, 6, text, 1, rgb565(255, 255, 255));
+    draw_text(83, 8, text, 1, rgb565(255, 255, 255));
+    draw_text(83, 21, "EASY", 1, rgb565(255, 211, 73));
     snprintf(text, sizeof(text), "VOL %d", game->volume);
-    draw_text(184, 6, text, 1, game->volume ? rgb565(255, 207, 68) : rgb565(140, 145, 155));
-    fill_rect(6, 19, 62, 5, rgb565(65, 28, 38));
-    fill_rect(7, 20, game->health * 60 / 100, 3,
+    draw_text(187, 8, text, 1,
+              game->volume ? rgb565(255, 174, 204) : rgb565(140, 145, 155));
+    fill_rect(187, 22, 43, 5, rgb565(65, 28, 38));
+    fill_rect(188, 23, game->health * 41 / 100, 3,
               game->health > 35 ? rgb565(50, 229, 112) : rgb565(255, 56, 72));
-    draw_text(73, 18, "TILT", 1, rgb565(166, 177, 193));
+    draw_text(116, 21, "TILT", 1, rgb565(118, 135, 157));
     int tilt = game->tilt_mg;
     if (tilt < -600) tilt = -600;
     if (tilt > 600) tilt = 600;
-    fill_rect(105, 21, 45, 2, rgb565(60, 70, 87));
-    fill_rect(127, 18, 2, 7, rgb565(245, 245, 245));
-    fill_rect(127 + tilt * 20 / 600, 19, 3, 5, rgb565(255, 84, 103));
+    fill_rect(145, 24, 24, 2, rgb565(60, 70, 87));
+    fill_rect(156, 21, 2, 7, rgb565(245, 245, 245));
+    fill_rect(156 + tilt * 10 / 600, 22, 3, 5, rgb565(255, 84, 103));
 }
 
 static void draw_center_panel(int y, int height)
 {
+    fill_rect(16, y + 5, 216, height, rgb565(2, 4, 12));
     fill_rect(12, y, 216, height, rgb565(5, 9, 22));
+    fill_rect(16, y + 5, 208, height - 10, rgb565(8, 14, 31));
     fill_rect(12, y, 216, 2, rgb565(39, 218, 246));
     fill_rect(12, y + height - 2, 216, 2, rgb565(244, 45, 101));
     fill_rect(10, y + 8, 2, height - 16, rgb565(39, 218, 246));
     fill_rect(228, y + 8, 2, height - 16, rgb565(244, 45, 101));
+    fill_rect(19, y + 8, 36, 1, rgb565(44, 92, 120));
+    fill_rect(185, y + height - 9, 36, 1, rgb565(130, 42, 80));
 }
 
 esp_err_t box2_lcd_render_racing(const box2_game_frame_t *game)
@@ -591,7 +772,13 @@ esp_err_t box2_lcd_render_racing(const box2_game_frame_t *game)
     char text[32];
     if (game->screen == BOX2_GAME_TITLE) {
         draw_center_panel(53, 157);
+        for (int i = 0; i < 18; ++i) {
+            fill_rect(18 + i * 11, 201, 6, 3,
+                      (i & 1) ? rgb565(43, 218, 245) : rgb565(241, 49, 109));
+        }
+        draw_text(41, 72, "NEON", 4, rgb565(14, 49, 72));
         draw_text(38, 69, "NEON", 4, rgb565(45, 221, 255));
+        draw_text(53, 108, "RUSH", 4, rgb565(76, 13, 50));
         draw_text(50, 105, "RUSH", 4, rgb565(255, 52, 102));
         if (game->steering_ready) {
             draw_text(45, 148, "STEERING Y FIXED", 1, rgb565(68, 236, 142));
@@ -603,8 +790,10 @@ esp_err_t box2_lcd_render_racing(const box2_game_frame_t *game)
             draw_text(30, 183, "AUTO AXIS CALIBRATION", 1, rgb565(147, 168, 194));
         }
     } else if (game->screen == BOX2_GAME_COUNTDOWN) {
-        fill_circle(120, 143, 43, rgb565(5, 9, 22));
-        fill_circle(120, 143, 38, rgb565(232, 42, 83));
+        fill_circle(123, 147, 47, rgb565(3, 5, 14));
+        fill_circle(120, 143, 45, rgb565(25, 194, 229));
+        fill_circle(120, 143, 40, rgb565(5, 9, 22));
+        fill_circle(120, 143, 35, rgb565(232, 42, 83));
         snprintf(text, sizeof(text), "%d", game->countdown);
         draw_text(102, 112, text, 8, rgb565(255, 255, 255));
         draw_text(72, 191, "GET READY", 2, rgb565(255, 218, 70));
