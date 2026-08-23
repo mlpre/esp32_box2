@@ -5,6 +5,8 @@
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 static const char *TAG = "box2_audio";
 static i2s_chan_handle_t s_tx_channel;
 static i2s_chan_handle_t s_rx_channel;
@@ -14,6 +16,106 @@ static const audio_codec_gpio_if_t *s_gpio_if;
 static const audio_codec_if_t *s_codec_if;
 static esp_codec_dev_handle_t s_output_dev;
 static esp_codec_dev_handle_t s_input_dev;
+static volatile int s_volume = 50;
+static volatile int s_engine_percent;
+static volatile int s_pending_effect = -1;
+static volatile int s_custom_frequency;
+static volatile int s_custom_duration_ms;
+
+static int16_t triangle_sample(uint32_t phase, int amplitude)
+{
+    uint16_t p = (uint16_t)(phase >> 16);
+    int32_t wave = p < 32768 ? (int32_t)p : (int32_t)(65535 - p);
+    return (int16_t)(((wave - 16384) * amplitude) / 16384);
+}
+
+static void audio_task(void *arg)
+{
+    (void)arg;
+    enum { BLOCK_SAMPLES = 240 };
+    int16_t samples[BLOCK_SAMPLES];
+    uint32_t engine_phase = 0;
+    uint32_t harmonic_phase = 0;
+    uint32_t effect_phase = 0;
+    uint32_t noise = 0x4a3b2c1d;
+    int active_effect = -1;
+    int effect_block = 0;
+    int effect_blocks = 0;
+    int applied_volume = -1;
+    while (true) {
+        if (applied_volume != s_volume) {
+            applied_volume = s_volume;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(
+                esp_codec_dev_set_out_vol(s_output_dev, applied_volume));
+        }
+        int requested = s_pending_effect;
+        if (requested >= 0) {
+            s_pending_effect = -1;
+            active_effect = requested;
+            effect_block = 0;
+            switch (active_effect) {
+                case BOX2_SFX_MENU: effect_blocks = 9; break;
+                case BOX2_SFX_START: effect_blocks = 48; break;
+                case BOX2_SFX_PASS: effect_blocks = 16; break;
+                case BOX2_SFX_CRASH: effect_blocks = 38; break;
+                case BOX2_SFX_GAME_OVER: effect_blocks = 85; break;
+                default: effect_blocks = s_custom_duration_ms / 10; break;
+            }
+            effect_phase = 0;
+        }
+        int engine = s_engine_percent;
+        if (engine < 0) engine = 0;
+        if (engine > 100) engine = 100;
+        uint32_t engine_step = ((uint64_t)(55 + engine * 2) << 32) /
+                               BOX2_AUDIO_SAMPLE_RATE;
+        uint32_t harmonic_step = engine_step * 2 + engine_step / 2;
+        for (int i = 0; i < BLOCK_SAMPLES; ++i) {
+            int sample = 0;
+            if (engine > 0) {
+                sample = triangle_sample(engine_phase, 900 + engine * 16);
+                sample += triangle_sample(harmonic_phase, 260 + engine * 5);
+                engine_phase += engine_step;
+                harmonic_phase += harmonic_step;
+            }
+            if (active_effect >= 0) {
+                int progress = effect_block * 100 / (effect_blocks ? effect_blocks : 1);
+                int frequency = 900;
+                int amplitude = 6000;
+                if (active_effect == BOX2_SFX_START) {
+                    frequency = 380 + progress * 9;
+                } else if (active_effect == BOX2_SFX_PASS) {
+                    frequency = 1100 + progress * 8;
+                } else if (active_effect == BOX2_SFX_GAME_OVER) {
+                    frequency = 700 - progress * 5;
+                    amplitude = 5200 - progress * 28;
+                } else if (active_effect == BOX2_SFX_CRASH) {
+                    noise ^= noise << 13;
+                    noise ^= noise >> 17;
+                    noise ^= noise << 5;
+                    amplitude = 7500 - progress * 55;
+                    sample += ((int)(noise & 0xffff) - 32768) * amplitude / 32768;
+                    frequency = 120 - progress / 2;
+                } else if (active_effect > BOX2_SFX_GAME_OVER) {
+                    frequency = s_custom_frequency;
+                }
+                if (amplitude < 500) amplitude = 500;
+                uint32_t step = ((uint64_t)(uint32_t)frequency << 32) /
+                                BOX2_AUDIO_SAMPLE_RATE;
+                sample += triangle_sample(effect_phase, amplitude);
+                effect_phase += step;
+            }
+            if (sample > INT16_MAX) sample = INT16_MAX;
+            if (sample < INT16_MIN) sample = INT16_MIN;
+            samples[i] = (int16_t)sample;
+        }
+        if (esp_codec_dev_write(s_output_dev, samples, sizeof(samples)) != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (active_effect >= 0 && ++effect_block >= effect_blocks) {
+            active_effect = -1;
+        }
+    }
+}
 esp_err_t box2_audio_init(i2c_master_bus_handle_t i2c_bus)
 {
     i2s_chan_config_t channel_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
@@ -107,7 +209,8 @@ esp_err_t box2_audio_init(i2c_master_bus_handle_t i2c_bus)
     };
     ESP_RETURN_ON_ERROR(esp_codec_dev_open(s_output_dev, &sample_info), TAG, "open speaker");
     ESP_RETURN_ON_ERROR(esp_codec_dev_open(s_input_dev, &sample_info), TAG, "open microphone");
-    ESP_RETURN_ON_ERROR(esp_codec_dev_set_out_vol(s_output_dev, 0), TAG, "silence speaker");
+    ESP_RETURN_ON_ERROR(esp_codec_dev_set_out_vol(s_output_dev, s_volume), TAG,
+                        "set default speaker volume");
     ESP_RETURN_ON_ERROR(esp_codec_dev_set_in_gain(s_input_dev, 40.0f), TAG, "set mic gain");
     int chip_id0 = 0;
     int chip_id1 = 0;
@@ -116,34 +219,49 @@ esp_err_t box2_audio_init(i2c_master_bus_handle_t i2c_bus)
     ESP_LOGI(TAG, "ES8389 register ID: %s FD=0x%02X FE=0x%02X",
              (id0_err == 0 && id1_err == 0) ? "read OK" : "unavailable",
              chip_id0 & 0xff, chip_id1 & 0xff);
+    ESP_RETURN_ON_FALSE(xTaskCreate(audio_task, "race_audio", 4096, NULL, 5, NULL) == pdPASS,
+                        ESP_ERR_NO_MEM, TAG, "create audio task");
     return ESP_OK;
 }
+
+esp_err_t box2_audio_set_volume(int percent)
+{
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    s_volume = percent;
+    return s_output_dev ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+int box2_audio_get_volume(void)
+{
+    return s_volume;
+}
+
+void box2_audio_set_engine(int speed_percent)
+{
+    if (speed_percent < 0) speed_percent = 0;
+    if (speed_percent > 100) speed_percent = 100;
+    s_engine_percent = speed_percent;
+}
+
+esp_err_t box2_audio_play_effect(box2_audio_effect_t effect)
+{
+    if (!s_output_dev || effect < BOX2_SFX_MENU || effect > BOX2_SFX_GAME_OVER) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    s_pending_effect = effect;
+    return ESP_OK;
+}
+
 esp_err_t box2_audio_play_tone(int frequency_hz, int duration_ms)
 {
     if (!s_output_dev || frequency_hz <= 0 || duration_ms <= 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    enum { FRAME_SAMPLES = 240 };
-    int16_t samples[FRAME_SAMPLES];
-    uint32_t phase = 0;
-    const uint32_t phase_step = ((uint64_t)(uint32_t)frequency_hz << 32) /
-                                BOX2_AUDIO_SAMPLE_RATE;
-    int frames = (duration_ms * BOX2_AUDIO_SAMPLE_RATE + FRAME_SAMPLES * 1000 - 1) /
-                 (FRAME_SAMPLES * 1000);
-    ESP_RETURN_ON_ERROR(esp_codec_dev_set_out_vol(s_output_dev, 65), TAG, "enable test tone");
-    for (int frame = 0; frame < frames; ++frame) {
-        for (int i = 0; i < FRAME_SAMPLES; ++i) {
-            uint16_t p = (uint16_t)(phase >> 16);
-            int32_t triangle = p < 32768 ? (int32_t)p : (int32_t)(65535 - p);
-            samples[i] = (int16_t)((triangle - 16384) / 3);
-            phase += phase_step;
-        }
-        int err = esp_codec_dev_write(s_output_dev, samples, sizeof(samples));
-        if (err != ESP_OK) {
-            return err;
-        }
-    }
-    return esp_codec_dev_set_out_vol(s_output_dev, 0);
+    s_custom_frequency = frequency_hz;
+    s_custom_duration_ms = duration_ms;
+    s_pending_effect = BOX2_SFX_GAME_OVER + 1;
+    return ESP_OK;
 }
 esp_err_t box2_audio_read_peak(int *peak)
 {

@@ -1,271 +1,276 @@
-#include <inttypes.h>
+#include <math.h>
 #include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <stdint.h>
+#include <string.h>
 #include "box2_audio.h"
 #include "box2_board.h"
 #include "box2_lcd.h"
 #include "box2_motion.h"
-#include "box2_storage.h"
-#include "esp_chip_info.h"
-#include "esp_check.h"
-#include "esp_event.h"
-#include "esp_flash.h"
-#include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_netif.h"
-#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "nvs_flash.h"
-static const char *TAG = "box2_demo";
+
+static const char *TAG = "neon_rush";
+
 typedef struct {
-    bool initialized;
-    bool scan_ok;
-    uint16_t ap_count;
-    int8_t strongest_rssi;
-    char strongest_ssid[33];
-} wifi_test_state_t;
-static wifi_test_state_t s_wifi;
-static esp_err_t wifi_test_init(void)
+    box2_game_frame_t view;
+    float distance_exact;
+    float lateral_velocity;
+    float curve_target;
+    float curve_timer;
+    int bonus_score;
+    int invulnerable_ms;
+    int center_x_mg;
+    int center_y_mg;
+    uint32_t random;
+    TickType_t countdown_started;
+} race_game_t;
+
+static uint32_t race_random(race_game_t *game)
 {
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_RETURN_ON_ERROR(nvs_flash_erase(), TAG, "erase NVS");
-        err = nvs_flash_init();
-    }
-    ESP_RETURN_ON_ERROR(err, TAG, "initialize NVS");
-    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "initialize network stack");
-    ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "create event loop");
-    wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_RETURN_ON_ERROR(esp_wifi_init(&config), TAG, "initialize Wi-Fi");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), TAG, "set Wi-Fi storage");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set station mode");
-    ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "start Wi-Fi");
-    s_wifi.initialized = true;
-    return ESP_OK;
+    uint32_t x = game->random;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    game->random = x;
+    return x;
 }
-static esp_err_t wifi_test_scan(void)
+
+static float clampf(float value, float minimum, float maximum)
 {
-    if (!s_wifi.initialized) {
-        return ESP_ERR_INVALID_STATE;
+    if (value < minimum) return minimum;
+    if (value > maximum) return maximum;
+    return value;
+}
+
+static void reset_traffic(race_game_t *game)
+{
+    static const float lanes[] = {-0.72f, 0.0f, 0.72f};
+    for (int i = 0; i < BOX2_GAME_TRAFFIC_MAX; ++i) {
+        game->view.traffic[i].active = true;
+        game->view.traffic[i].depth = 0.08f + i * 0.18f;
+        game->view.traffic[i].lane_x = lanes[race_random(game) % 3];
+        game->view.traffic[i].color = (uint8_t)(1 + race_random(game) % 5);
     }
-    const wifi_scan_config_t scan_config = {
-        .ssid = NULL,
-        .bssid = NULL,
-        .channel = 0,
-        .show_hidden = true,
-        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-        .scan_time.active = {
-            .min = 100,
-            .max = 250,
-        },
-        .home_chan_dwell_time = 30,
-    };
-    ESP_LOGI(TAG, "Scanning 2.4 GHz Wi-Fi...");
-    esp_err_t err = esp_wifi_scan_start(&scan_config, true);
-    if (err != ESP_OK) {
-        s_wifi.scan_ok = false;
-        return err;
-    }
-    uint16_t count = 0;
-    ESP_RETURN_ON_ERROR(esp_wifi_scan_get_ap_num(&count), TAG, "get AP count");
-    uint16_t read_count = count > 24 ? 24 : count;
-    wifi_ap_record_t *records = calloc(read_count ? read_count : 1, sizeof(*records));
-    ESP_RETURN_ON_FALSE(records, ESP_ERR_NO_MEM, TAG, "allocate AP records");
-    err = esp_wifi_scan_get_ap_records(&read_count, records);
-    if (err == ESP_OK) {
-        s_wifi.ap_count = count;
-        s_wifi.strongest_rssi = read_count ? records[0].rssi : -127;
-        snprintf(s_wifi.strongest_ssid, sizeof(s_wifi.strongest_ssid), "%s",
-                 read_count ? (const char *)records[0].ssid : "NONE");
-        s_wifi.scan_ok = true;
-        ESP_LOGI(TAG, "Wi-Fi scan PASS: %u AP(s), strongest '%s' (%d dBm)",
-                 count, s_wifi.strongest_ssid, s_wifi.strongest_rssi);
-        for (uint16_t i = 0; i < read_count && i < 10; ++i) {
-            ESP_LOGI(TAG, "  %2u  ch=%2u  rssi=%4d  %s", i + 1, records[i].primary,
-                     records[i].rssi, records[i].ssid);
+}
+
+static void start_race(race_game_t *game, TickType_t now)
+{
+    int best = game->view.best_score;
+    int volume = game->view.volume;
+    int tilt = game->view.tilt_mg;
+    memset(&game->view, 0, sizeof(game->view));
+    game->view.screen = BOX2_GAME_COUNTDOWN;
+    game->view.countdown = 3;
+    game->view.health = 100;
+    game->view.volume = volume;
+    game->view.best_score = best;
+    game->view.tilt_mg = tilt;
+    game->distance_exact = 0.0f;
+    game->lateral_velocity = 0.0f;
+    game->curve_target = 0.0f;
+    game->curve_timer = 2.0f;
+    game->bonus_score = 0;
+    game->invulnerable_ms = 0;
+    game->countdown_started = now;
+    reset_traffic(game);
+    box2_audio_set_engine(0);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_START));
+}
+
+static void set_volume(race_game_t *game, int volume)
+{
+    if (volume < 0) volume = 0;
+    if (volume > 100) volume = 100;
+    if (volume == game->view.volume) return;
+    game->view.volume = volume;
+    game->view.muted = volume == 0;
+    ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_set_volume(volume));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_MENU));
+}
+
+static void update_traffic(race_game_t *game, float dt)
+{
+    static const float lanes[] = {-0.72f, 0.0f, 0.72f};
+    float advance = dt * (0.085f + game->view.speed_kmh / 850.0f);
+    for (int i = 0; i < BOX2_GAME_TRAFFIC_MAX; ++i) {
+        box2_game_traffic_t *car = &game->view.traffic[i];
+        if (!car->active) continue;
+        car->depth += advance;
+        if (car->depth > 1.08f) {
+            car->depth = 0.04f + (race_random(game) % 8) * 0.01f;
+            car->lane_x = lanes[race_random(game) % 3];
+            car->color = (uint8_t)(1 + race_random(game) % 5);
+            game->bonus_score += 100;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_PASS));
+            continue;
         }
-    } else {
-        s_wifi.scan_ok = false;
+        if (game->invulnerable_ms <= 0 && car->depth > 0.79f && car->depth < 1.01f &&
+            fabsf(game->view.player_x - car->lane_x) < 0.34f) {
+            game->view.health -= 34;
+            if (game->view.health < 0) game->view.health = 0;
+            game->view.speed_kmh *= 0.38f;
+            game->lateral_velocity += game->view.player_x > car->lane_x ? 0.9f : -0.9f;
+            game->invulnerable_ms = 1100;
+            car->depth = 1.09f;
+            ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_CRASH));
+        }
     }
-    free(records);
-    return err;
 }
-static void print_system_info(uint32_t *flash_mb, uint32_t *psram_mb)
+
+static void update_running(race_game_t *game, const box2_motion_state_t *motion,
+                           float dt)
 {
-    esp_chip_info_t chip_info;
-    uint32_t flash_size = 0;
-    esp_chip_info(&chip_info);
-    ESP_ERROR_CHECK(esp_flash_get_size(NULL, &flash_size));
-    size_t psram_size = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-    *flash_mb = flash_size / (1024 * 1024);
-    *psram_mb = (uint32_t)(psram_size / (1024 * 1024));
-    ESP_LOGI(TAG, "ATK-DNESP32S3-BOX2-WIFI hardware test");
-    ESP_LOGI(TAG, "chip=%s cores=%u rev=%u flash=%" PRIu32 "MB psram=%" PRIu32 "MB",
-             CONFIG_IDF_TARGET, chip_info.cores, chip_info.revision, *flash_mb, *psram_mb);
+    int steer_mg = motion->x_mg - game->center_x_mg;
+    int throttle_mg = motion->y_mg - game->center_y_mg;
+    game->view.tilt_mg = steer_mg;
+    float steering = clampf(steer_mg / 520.0f, -1.0f, 1.0f);
+    float target_speed = 142.0f - throttle_mg * 0.11f;
+    target_speed = clampf(target_speed, 72.0f, 224.0f);
+    if (fabsf(game->view.player_x) > 0.84f) target_speed *= 0.48f;
+    game->view.speed_kmh += (target_speed - game->view.speed_kmh) * dt * 1.7f;
+    game->lateral_velocity += steering * dt * 4.4f;
+    game->lateral_velocity *= 1.0f - clampf(dt * 3.6f, 0.0f, 0.9f);
+    game->view.player_x += game->lateral_velocity * dt;
+    if (game->view.player_x < -1.05f) {
+        game->view.player_x = -1.05f;
+        game->lateral_velocity = 0.1f;
+    }
+    if (game->view.player_x > 1.05f) {
+        game->view.player_x = 1.05f;
+        game->lateral_velocity = -0.1f;
+    }
+    game->curve_timer -= dt;
+    if (game->curve_timer <= 0.0f) {
+        game->curve_target = ((int)(race_random(game) % 161) - 80) / 100.0f;
+        game->curve_timer = 3.2f + (race_random(game) % 35) / 10.0f;
+    }
+    game->view.curve += (game->curve_target - game->view.curve) * dt * 0.34f;
+    game->view.road_phase += game->view.speed_kmh * dt / 96.0f;
+    while (game->view.road_phase >= 1.0f) game->view.road_phase -= 1.0f;
+    game->distance_exact += game->view.speed_kmh * dt / 3.6f;
+    game->view.distance_m = (int)game->distance_exact;
+    game->view.score = game->bonus_score + game->view.distance_m * 2;
+    if (game->invulnerable_ms > 0) game->invulnerable_ms -= (int)(dt * 1000.0f);
+    update_traffic(game, dt);
+    box2_audio_set_engine((int)(game->view.speed_kmh * 100.0f / 224.0f));
+    if (game->view.health <= 0) {
+        game->view.screen = BOX2_GAME_OVER;
+        if (game->view.score > game->view.best_score) game->view.best_score = game->view.score;
+        box2_audio_set_engine(0);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_GAME_OVER));
+    }
 }
-static void update_screen(bool lcd_ok, bool audio_ok, bool board_ok,
-                          uint32_t flash_mb, uint32_t psram_mb,
-                          const box2_board_state_t *board,
-                          const box2_motion_state_t *motion,
-                          const box2_storage_state_t *storage, int mic_peak)
+
+static void update_countdown(race_game_t *game, TickType_t now)
 {
-    if (!lcd_ok) {
-        return;
-    }
-    char text[17][40];
-    const char *lines[17];
-    for (int i = 0; i < 17; ++i) {
-        lines[i] = text[i];
-    }
-    snprintf(text[0], sizeof(text[0]), "SYS FLASH=%" PRIu32 "M PSRAM=%" PRIu32 "M CPU=240M",
-             flash_mb, psram_mb);
-    int i2c_count = box2_board_i2c_device_count();
-    bool i2c_ok = board_ok && i2c_count >= 3;
-    snprintf(text[1], sizeof(text[1]), "I2C %s N=%d ADDR=10,19,20", i2c_ok ? "OK" : "FAIL",
-             i2c_count);
-    snprintf(text[2], sizeof(text[2]), "XIO %s RAW=%04X SAFE=%s",
-             board->expander_outputs_ok ? "OK" : "FAIL", board->xio,
-             board->expander_outputs_ok ? "OK" : "FAIL");
-    snprintf(text[3], sizeof(text[3]), "LCD OK 240X320 I80 BL=PWM");
-    snprintf(text[4], sizeof(text[4]), "AUDIO %s MIC=%d %s", audio_ok ? "OK" : "FAIL",
-             mic_peak, audio_ok ? "LIVE" : "OFF");
-    snprintf(text[5], sizeof(text[5]), "WIFI %s AP=%u RSSI=%dDBM", s_wifi.scan_ok ? "OK" : "FAIL",
-             s_wifi.ap_count, s_wifi.strongest_rssi);
-    snprintf(text[6], sizeof(text[6]), "SSID %.31s", s_wifi.strongest_ssid);
-    snprintf(text[7], sizeof(text[7]), "BAT %dMV %d%% %s ADC=%d", board->battery_mv_estimate,
-             board->battery_percent, board->charging ? "USB" : "BAT", board->battery_raw);
-    snprintf(text[8], sizeof(text[8]), "KEY L%d Q%d M%d R%d RAW=%d%d%d%d", board->left_pressed,
-             board->q_pressed, board->middle_pressed, board->right_pressed,
-             board->left_level, board->q_level, board->middle_level, board->right_level);
-    snprintf(text[9], sizeof(text[9]), "ACC %s ID=%02X ORI=%s",
-             motion->detected ? "OK" : "FAIL", motion->who_am_i,
-             motion->orientation ? motion->orientation : "NONE");
-    snprintf(text[10], sizeof(text[10]), "ACC X=%+5dMG RAW=%+6d", motion->x_mg, motion->raw_x);
-    snprintf(text[11], sizeof(text[11]), "ACC Y=%+5dMG RAW=%+6d", motion->y_mg, motion->raw_y);
-    snprintf(text[12], sizeof(text[12]), "ACC Z=%+5dMG RAW=%+6d", motion->z_mg, motion->raw_z);
-    snprintf(text[13], sizeof(text[13]), "SD %s NAME=%s RW=%s",
-             storage->mounted ? "OK" : "NO CARD", storage->name[0] ? storage->name : "-",
-             storage->read_write_ok ? "OK" : "FAIL");
-    snprintf(text[14], sizeof(text[14]), "SD CAP=%" PRIu32 "M FAT=%" PRIu32 "M FREE=%" PRIu32 "M",
-             storage->capacity_mb, storage->total_mb, storage->free_mb);
-    snprintf(text[15], sizeof(text[15]), "SD SPI S17 MO16 MI18 CS15 25M");
-    snprintf(text[16], sizeof(text[16]), "TONE L440 Q660 M880 R1040");
-    int meter = mic_peak * 100 / 6000;
-    if (meter > 100) meter = 100;
-    esp_err_t err = box2_lcd_show_lines("BOX2 COMPLETE HARDWARE TEST", lines, 17, meter);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "LCD refresh failed: %s", esp_err_to_name(err));
+    uint32_t elapsed_ms = (uint32_t)((now - game->countdown_started) * portTICK_PERIOD_MS);
+    game->view.countdown = 3 - (int)(elapsed_ms / 1000);
+    game->view.road_phase += 0.006f;
+    if (game->view.road_phase >= 1.0f) game->view.road_phase -= 1.0f;
+    if (elapsed_ms >= 3000) {
+        game->view.screen = BOX2_GAME_RUNNING;
+        game->view.countdown = 0;
+        game->view.speed_kmh = 78.0f;
     }
 }
+
+static void calibrate_motion(race_game_t *game, box2_motion_state_t *motion)
+{
+    int64_t sum_x = 0;
+    int64_t sum_y = 0;
+    int samples = 0;
+    for (int i = 0; i < 48; ++i) {
+        if (box2_motion_read(motion) == ESP_OK) {
+            sum_x += motion->x_mg;
+            sum_y += motion->y_mg;
+            ++samples;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (samples > 0) {
+        game->center_x_mg = (int)(sum_x / samples);
+        game->center_y_mg = (int)(sum_y / samples);
+    }
+    ESP_LOGI(TAG, "tilt center calibrated: x=%d mg y=%d mg",
+             game->center_x_mg, game->center_y_mg);
+}
+
 void app_main(void)
 {
-    uint32_t flash_mb = 0;
-    uint32_t psram_mb = 0;
-    print_system_info(&flash_mb, &psram_mb);
-    bool board_ok = box2_board_init() == ESP_OK;
-    ESP_LOGI(TAG, "I2C/TCA9555 test: %s", board_ok ? "PASS" : "FAIL");
-    bool lcd_ok = box2_lcd_init() == ESP_OK;
-    ESP_LOGI(TAG, "LCD/backlight test: %s", lcd_ok ? "PASS" : "FAIL");
-    if (lcd_ok) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_lcd_show_color_test());
-        vTaskDelay(pdMS_TO_TICKS(900));
-    }
-    box2_board_state_t board_state = {0};
-    if (board_ok) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_board_read_state(&board_state, true));
-        ESP_LOGI(TAG, "battery raw=%d estimate=%d mV level=%d%% charging=%d",
-                 board_state.battery_raw, board_state.battery_mv_estimate,
-                 board_state.battery_percent, board_state.charging);
-    }
-    box2_motion_state_t motion_state = {0};
-    bool motion_ok = board_ok && box2_motion_init(box2_board_i2c_bus()) == ESP_OK;
-    if (motion_ok) {
-        motion_ok = box2_motion_read(&motion_state) == ESP_OK;
-    }
-    ESP_LOGI(TAG, "SC7A20 test: %s", motion_ok ? "PASS" : "FAIL");
-    box2_storage_state_t storage_state = {0};
-    bool storage_ok = box2_storage_test(&storage_state) == ESP_OK;
-    ESP_LOGI(TAG, "TF/MicroSD test: %s", storage_ok ? "PASS" : "FAIL");
-    bool audio_ok = board_ok && box2_audio_init(box2_board_i2c_bus()) == ESP_OK;
-    ESP_LOGI(TAG, "ES8389/I2S test: %s", audio_ok ? "PASS" : "FAIL");
+    ESP_LOGI(TAG, "NEON RUSH starting");
+    ESP_ERROR_CHECK(box2_board_init());
+    ESP_ERROR_CHECK(box2_lcd_init());
+    ESP_ERROR_CHECK(box2_motion_init(box2_board_i2c_bus()));
+    bool audio_ok = box2_audio_init(box2_board_i2c_bus()) == ESP_OK;
+    if (!audio_ok) ESP_LOGW(TAG, "audio unavailable; game will continue silently");
+
+    race_game_t game = {
+        .view = {
+            .screen = BOX2_GAME_TITLE,
+            .health = 100,
+            .volume = 50,
+        },
+        .random = 0x83f19a27,
+    };
+    reset_traffic(&game);
     if (audio_ok) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_tone(523, 180));
-        vTaskDelay(pdMS_TO_TICKS(80));
-        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_tone(784, 220));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_set_volume(50));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_MENU));
     }
-    bool wifi_ok = wifi_test_init() == ESP_OK && wifi_test_scan() == ESP_OK;
-    ESP_LOGI(TAG, "Wi-Fi radio test: %s", wifi_ok ? "PASS" : "FAIL");
-    bool previous_left = false;
-    bool previous_middle = false;
-    bool previous_right = false;
-    bool previous_q = board_state.q_pressed;
-    TickType_t last_screen = 0;
-    TickType_t last_battery = 0;
-    TickType_t last_motion = 0;
-    TickType_t last_log = 0;
-    int mic_peak = 0;
-    ESP_LOGI(TAG, "Interactive mode: L=440Hz, Q=660Hz, M=880Hz, R=1040Hz");
+    box2_motion_state_t motion = {0};
+    ESP_ERROR_CHECK_WITHOUT_ABORT(box2_lcd_render_racing(&game.view));
+    calibrate_motion(&game, &motion);
+
+    box2_board_state_t keys = {0};
+    box2_board_state_t previous = {0};
+    TickType_t last_tick = xTaskGetTickCount();
+    TickType_t last_render = 0;
     while (true) {
         TickType_t now = xTaskGetTickCount();
-        bool sample_battery = (now - last_battery) >= pdMS_TO_TICKS(5000);
-        if (board_ok && box2_board_read_state(&board_state, sample_battery) == ESP_OK &&
-            sample_battery) {
-            last_battery = now;
+        float dt = (float)(now - last_tick) * portTICK_PERIOD_MS / 1000.0f;
+        last_tick = now;
+        if (dt > 0.08f) dt = 0.08f;
+        if (box2_board_read_state(&keys, false) != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
         }
-        if (motion_ok && (now - last_motion) >= pdMS_TO_TICKS(100)) {
-            if (box2_motion_read(&motion_state) != ESP_OK) {
-                motion_state.detected = false;
+        if (box2_motion_read(&motion) != ESP_OK) motion.detected = false;
+        bool left_edge = keys.left_pressed && !previous.left_pressed;
+        bool right_edge = keys.right_pressed && !previous.right_pressed;
+        bool middle_edge = keys.middle_pressed && !previous.middle_pressed;
+        bool q_edge = keys.q_pressed && !previous.q_pressed;
+        previous = keys;
+
+        if (left_edge) set_volume(&game, game.view.volume - 10);
+        if (right_edge) set_volume(&game, game.view.volume + 10);
+        if (q_edge) start_race(&game, now);
+        if (middle_edge) {
+            if (game.view.screen == BOX2_GAME_TITLE || game.view.screen == BOX2_GAME_OVER) {
+                start_race(&game, now);
+            } else if (game.view.screen == BOX2_GAME_RUNNING) {
+                game.view.screen = BOX2_GAME_PAUSED;
+                box2_audio_set_engine(0);
+                ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_MENU));
+            } else if (game.view.screen == BOX2_GAME_PAUSED) {
+                game.view.screen = BOX2_GAME_RUNNING;
+                ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_START));
             }
-            last_motion = now;
         }
-        if (audio_ok) {
-            int new_peak = 0;
-            if (box2_audio_read_peak(&new_peak) == ESP_OK) {
-                mic_peak = new_peak;
-            }
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(10));
+
+        if (game.view.screen == BOX2_GAME_COUNTDOWN) {
+            update_countdown(&game, now);
+        } else if (game.view.screen == BOX2_GAME_RUNNING && motion.detected) {
+            update_running(&game, &motion, dt);
+        } else if (game.view.screen == BOX2_GAME_TITLE) {
+            game.view.road_phase += dt * 0.12f;
+            if (game.view.road_phase >= 1.0f) game.view.road_phase -= 1.0f;
         }
-        if (board_state.left_pressed && !previous_left && audio_ok) {
-            ESP_LOGI(TAG, "LEFT key: speaker 440 Hz");
-            ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_tone(440, 180));
+
+        if (now - last_render >= pdMS_TO_TICKS(50)) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(box2_lcd_render_racing(&game.view));
+            last_render = now;
         }
-        if (board_state.middle_pressed && !previous_middle && audio_ok) {
-            ESP_LOGI(TAG, "MIDDLE key: speaker 880 Hz");
-            ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_tone(880, 180));
-        }
-        if (board_state.q_pressed && !previous_q && audio_ok) {
-            ESP_LOGI(TAG, "Q key: speaker 660 Hz");
-            ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_tone(660, 180));
-        }
-        if (board_state.right_pressed && !previous_right && audio_ok) {
-            ESP_LOGI(TAG, "RIGHT key: speaker 1040 Hz");
-            ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_tone(1040, 180));
-        }
-        previous_left = board_state.left_pressed;
-        previous_middle = board_state.middle_pressed;
-        previous_right = board_state.right_pressed;
-        previous_q = board_state.q_pressed;
-        if ((now - last_screen) >= pdMS_TO_TICKS(400)) {
-            update_screen(lcd_ok, audio_ok, board_ok, flash_mb, psram_mb,
-                          &board_state, &motion_state, &storage_state, mic_peak);
-            last_screen = now;
-        }
-        if ((now - last_log) >= pdMS_TO_TICKS(2000)) {
-            last_log = now;
-            ESP_LOGI(TAG, "mic=%5d keys=L%d Q%d M%d R%d raw=%d%d%d%d battery=%d%% "
-                     "xio=0x%04X acc=%+d,%+d,%+dmg orient=%s sd=%s rw=%s",
-                     mic_peak, board_state.left_pressed, board_state.q_pressed,
-                     board_state.middle_pressed, board_state.right_pressed,
-                     board_state.left_level, board_state.q_level,
-                     board_state.middle_level, board_state.right_level,
-                     board_state.battery_percent, board_state.xio, motion_state.x_mg,
-                     motion_state.y_mg, motion_state.z_mg,
-                     motion_state.orientation ? motion_state.orientation : "NONE",
-                     storage_state.mounted ? "MOUNTED" : "NO_CARD",
-                     storage_state.read_write_ok ? "PASS" : "FAIL");
-        }
+        vTaskDelay(pdMS_TO_TICKS(4));
     }
 }
