@@ -810,6 +810,13 @@ esp_err_t box2_lcd_render_racing(const box2_game_frame_t *game)
         snprintf(text, sizeof(text), "BEST  %05d", game->best_score);
         draw_text(63, 162, text, 1, rgb565(72, 222, 250));
         draw_text(39, 193, "M/Q  RACE AGAIN", 1, rgb565(255, 215, 68));
+    } else if (game->screen == BOX2_GAME_SHUTDOWN) {
+        draw_center_panel(92, 112);
+        fill_circle(120, 126, 18, rgb565(28, 207, 239));
+        fill_circle(120, 126, 13, rgb565(8, 14, 31));
+        fill_rect(118, 101, 5, 25, rgb565(255, 255, 255));
+        draw_text(45, 157, "POWERING OFF", 2, rgb565(255, 255, 255));
+        draw_text(57, 184, "SEE YOU SOON", 1, rgb565(139, 164, 188));
     }
     return present_frame();
 }

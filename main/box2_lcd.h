@@ -12,6 +12,7 @@ typedef enum {
     BOX2_GAME_RUNNING,
     BOX2_GAME_PAUSED,
     BOX2_GAME_OVER,
+    BOX2_GAME_SHUTDOWN,
 } box2_game_screen_t;
 
 typedef struct {

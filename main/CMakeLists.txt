@@ -16,6 +16,7 @@ idf_component_register(
         esp_driver_sdspi
         esp_driver_spi
         esp_event
+        esp_hw_support
         fatfs
         esp_lcd
         esp_netif

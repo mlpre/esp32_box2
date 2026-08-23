@@ -7,6 +7,7 @@
 #include "box2_lcd.h"
 #include "box2_motion.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -233,6 +234,36 @@ static void calibrate_motion(race_game_t *game, box2_motion_state_t *motion)
     ESP_LOGI(TAG, "steering fixed to BOX2 screen horizontal axis Y+");
 }
 
+static void handle_middle_short_press(race_game_t *game, TickType_t now)
+{
+    if (game->view.screen == BOX2_GAME_TITLE && !game->view.steering_ready) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_MENU));
+    } else if (game->view.screen == BOX2_GAME_TITLE ||
+               game->view.screen == BOX2_GAME_OVER) {
+        start_race(game, now);
+    } else if (game->view.screen == BOX2_GAME_RUNNING) {
+        game->view.screen = BOX2_GAME_PAUSED;
+        box2_audio_set_engine(0);
+        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_MENU));
+    } else if (game->view.screen == BOX2_GAME_PAUSED) {
+        game->view.screen = BOX2_GAME_RUNNING;
+        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_START));
+    }
+}
+
+static void power_off(race_game_t *game)
+{
+    ESP_LOGI(TAG, "M key held for 2 seconds: shutting down");
+    game->view.screen = BOX2_GAME_SHUTDOWN;
+    box2_audio_set_engine(0);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_MENU));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(box2_lcd_render_racing(&game->view));
+    vTaskDelay(pdMS_TO_TICKS(650));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(box2_board_power_off());
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_deep_sleep_start();
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "NEON RUSH starting");
@@ -263,6 +294,9 @@ void app_main(void)
     box2_board_state_t previous = {0};
     TickType_t last_tick = xTaskGetTickCount();
     TickType_t last_render = 0;
+    TickType_t middle_press_started = 0;
+    bool middle_press_active = false;
+    bool middle_long_handled = false;
     while (true) {
         TickType_t now = xTaskGetTickCount();
         float dt = (float)(now - last_tick) * portTICK_PERIOD_MS / 1000.0f;
@@ -276,30 +310,30 @@ void app_main(void)
         bool left_edge = keys.left_pressed && !previous.left_pressed;
         bool right_edge = keys.right_pressed && !previous.right_pressed;
         bool middle_edge = keys.middle_pressed && !previous.middle_pressed;
+        bool middle_release = !keys.middle_pressed && previous.middle_pressed;
         bool q_edge = keys.q_pressed && !previous.q_pressed;
         previous = keys;
+
+        if (middle_edge) {
+            middle_press_started = now;
+            middle_press_active = true;
+            middle_long_handled = false;
+        }
+        if (middle_press_active && keys.middle_pressed && !middle_long_handled &&
+            now - middle_press_started >= pdMS_TO_TICKS(2000)) {
+            middle_long_handled = true;
+            power_off(&game);
+        }
+        if (middle_release && middle_press_active) {
+            if (!middle_long_handled) handle_middle_short_press(&game, now);
+            middle_press_active = false;
+        }
 
         if (left_edge) set_volume(&game, game.view.volume - 10);
         if (right_edge) set_volume(&game, game.view.volume + 10);
         if (q_edge) {
             start_race(&game, now);
         }
-        if (middle_edge) {
-            if (game.view.screen == BOX2_GAME_TITLE && !game.view.steering_ready) {
-                ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_MENU));
-            } else if (game.view.screen == BOX2_GAME_TITLE ||
-                       game.view.screen == BOX2_GAME_OVER) {
-                start_race(&game, now);
-            } else if (game.view.screen == BOX2_GAME_RUNNING) {
-                game.view.screen = BOX2_GAME_PAUSED;
-                box2_audio_set_engine(0);
-                ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_MENU));
-            } else if (game.view.screen == BOX2_GAME_PAUSED) {
-                game.view.screen = BOX2_GAME_RUNNING;
-                ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_START));
-            }
-        }
-
         if (game.view.screen == BOX2_GAME_COUNTDOWN) {
             update_countdown(&game, now);
         } else if (game.view.screen == BOX2_GAME_RUNNING && motion.detected) {

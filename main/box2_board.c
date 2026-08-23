@@ -215,3 +215,12 @@ esp_err_t box2_board_read_state(box2_board_state_t *state, bool sample_battery)
     }
     return ESP_OK;
 }
+
+esp_err_t box2_board_power_off(void)
+{
+    ESP_RETURN_ON_FALSE(s_tca9555, ESP_ERR_INVALID_STATE, TAG,
+                        "TCA9555 is not initialized");
+    ESP_LOGI(TAG, "power off: releasing SYS_POW latch");
+    return tca_write_u16(TCA9555_REG_OUTPUT0,
+                         BOX2_XIO_SAFE_OUTPUTS & ~BOX2_XIO_SYS_POW);
+}
