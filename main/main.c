@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 
 static const char *TAG = "neon_rush";
+#define EASY_TRAFFIC_COUNT 2
 
 typedef struct {
     box2_game_frame_t view;
@@ -51,8 +52,8 @@ static void reset_traffic(race_game_t *game)
 {
     static const float lanes[] = {-0.72f, 0.0f, 0.72f};
     for (int i = 0; i < BOX2_GAME_TRAFFIC_MAX; ++i) {
-        game->view.traffic[i].active = true;
-        game->view.traffic[i].depth = 0.08f + i * 0.18f;
+        game->view.traffic[i].active = i < EASY_TRAFFIC_COUNT;
+        game->view.traffic[i].depth = 0.16f + i * 0.42f;
         game->view.traffic[i].lane_x = lanes[race_random(game) % 3];
         game->view.traffic[i].color = (uint8_t)(1 + race_random(game) % 5);
     }
@@ -102,7 +103,7 @@ static void set_volume(race_game_t *game, int volume)
 static void update_traffic(race_game_t *game, float dt)
 {
     static const float lanes[] = {-0.72f, 0.0f, 0.72f};
-    float advance = dt * (0.085f + game->view.speed_kmh / 850.0f);
+    float advance = dt * (0.045f + game->view.speed_kmh / 1400.0f);
     for (int i = 0; i < BOX2_GAME_TRAFFIC_MAX; ++i) {
         box2_game_traffic_t *car = &game->view.traffic[i];
         if (!car->active) continue;
@@ -115,13 +116,13 @@ static void update_traffic(race_game_t *game, float dt)
             ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_PASS));
             continue;
         }
-        if (game->invulnerable_ms <= 0 && car->depth > 0.79f && car->depth < 1.01f &&
-            fabsf(game->view.player_x - car->lane_x) < 0.34f) {
-            game->view.health -= 34;
+        if (game->invulnerable_ms <= 0 && car->depth > 0.84f && car->depth < 0.99f &&
+            fabsf(game->view.player_x - car->lane_x) < 0.25f) {
+            game->view.health -= 12;
             if (game->view.health < 0) game->view.health = 0;
             game->view.speed_kmh *= 0.38f;
             game->lateral_velocity += game->view.player_x > car->lane_x ? 0.9f : -0.9f;
-            game->invulnerable_ms = 1100;
+            game->invulnerable_ms = 2200;
             car->depth = 1.09f;
             ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_CRASH));
         }
@@ -143,19 +144,22 @@ static void update_running(race_game_t *game, const box2_motion_state_t *motion,
     int throttle_axis = game->steering_axis == 1 ? 0 : 1;
     int throttle_mg = delta[throttle_axis];
     int steering_after_deadzone = steer_mg;
-    if (steering_after_deadzone > 45) steering_after_deadzone -= 45;
-    else if (steering_after_deadzone < -45) steering_after_deadzone += 45;
+    if (steering_after_deadzone > 20) steering_after_deadzone -= 20;
+    else if (steering_after_deadzone < -20) steering_after_deadzone += 20;
     else steering_after_deadzone = 0;
     game->view.tilt_mg = steer_mg;
-    float steering = clampf(steering_after_deadzone / 300.0f, -1.0f, 1.0f);
-    float target_speed = 142.0f - throttle_mg * 0.11f;
-    target_speed = clampf(target_speed, 72.0f, 224.0f);
+    float steering = clampf(steering_after_deadzone / 160.0f, -1.0f, 1.0f);
+    float target_speed = 108.0f - throttle_mg * 0.055f;
+    target_speed = clampf(target_speed, 62.0f, 152.0f);
     if (fabsf(game->view.player_x) > 0.84f) target_speed *= 0.48f;
     game->view.speed_kmh += (target_speed - game->view.speed_kmh) * dt * 1.7f;
-    float target_lateral_velocity = steering * 1.85f;
+    float target_lateral_velocity = steering * 2.65f;
     game->lateral_velocity += (target_lateral_velocity - game->lateral_velocity) *
                               clampf(dt * 7.5f, 0.0f, 1.0f);
     game->view.player_x += game->lateral_velocity * dt;
+    if (fabsf(steering) < 0.08f) {
+        game->view.player_x *= 1.0f - clampf(dt * 0.42f, 0.0f, 0.08f);
+    }
     if (game->view.player_x < -1.05f) {
         game->view.player_x = -1.05f;
         game->lateral_velocity = 0.1f;
@@ -177,7 +181,7 @@ static void update_running(race_game_t *game, const box2_motion_state_t *motion,
     game->view.score = game->bonus_score + game->view.distance_m * 2;
     if (game->invulnerable_ms > 0) game->invulnerable_ms -= (int)(dt * 1000.0f);
     update_traffic(game, dt);
-    box2_audio_set_engine((int)(game->view.speed_kmh * 100.0f / 224.0f));
+    box2_audio_set_engine((int)(game->view.speed_kmh * 100.0f / 152.0f));
     if (game->view.health <= 0) {
         game->view.screen = BOX2_GAME_OVER;
         if (game->view.score > game->view.best_score) game->view.best_score = game->view.score;
@@ -195,7 +199,7 @@ static void update_countdown(race_game_t *game, TickType_t now)
     if (elapsed_ms >= 3000) {
         game->view.screen = BOX2_GAME_RUNNING;
         game->view.countdown = 0;
-        game->view.speed_kmh = 78.0f;
+        game->view.speed_kmh = 58.0f;
     }
 }
 
