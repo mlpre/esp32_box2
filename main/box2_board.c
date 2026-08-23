@@ -134,6 +134,7 @@ esp_err_t box2_board_init(void)
         if (i2c_master_probe(s_i2c_bus, address, 20) == ESP_OK) {
             ESP_LOGI(TAG, "  device @ 0x%02X%s", address,
                      address == 0x10 ? " (ES8389)" :
+                     address == BOX2_SC7A20_ADDR ? " (SC7A20)" :
                      address == BOX2_TCA9555_ADDR ? " (TCA9555)" : "");
             ++s_i2c_device_count;
         }

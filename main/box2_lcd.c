@@ -23,7 +23,7 @@ static SemaphoreHandle_t s_frame_done;
 static uint16_t *s_framebuffer;
 static bool s_dashboard_valid;
 static char s_last_title[32];
-static char s_last_lines[10][32];
+static char s_last_lines[17][40];
 static size_t s_last_line_count;
 static int s_last_meter = -1;
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
@@ -163,11 +163,12 @@ static esp_err_t present_region(int y_start, int y_end)
 }
 static void draw_meter(int meter_percent)
 {
-    fill_rect(0, 280, BOX2_LCD_WIDTH, 40, rgb565(5, 10, 20));
-    draw_text(8, 281, "MIC LEVEL", 1, rgb565(150, 170, 190));
-    fill_rect(8, 296, 224, 16, rgb565(25, 35, 50));
-    fill_rect(10, 298, meter_percent * 220 / 100, 12,
+    fill_rect(0, 282, BOX2_LCD_WIDTH, 38, rgb565(5, 10, 20));
+    draw_text(6, 284, "MIC", 1, rgb565(150, 170, 190));
+    fill_rect(30, 283, 204, 11, rgb565(25, 35, 50));
+    fill_rect(32, 285, meter_percent * 200 / 100, 7,
               meter_percent > 85 ? rgb565(255,70,50) : rgb565(40,210,100));
+    draw_text(6, 301, "LIVE AUDIO INPUT LEVEL", 1, rgb565(100,190,230));
 }
 static esp_err_t lcd_command(uint8_t command, const uint8_t *data, size_t length)
 {
@@ -325,8 +326,8 @@ esp_err_t box2_lcd_show_lines(const char *title, const char *const *lines,
                               size_t line_count, int meter_percent)
 {
     ESP_RETURN_ON_FALSE(title && lines, ESP_ERR_INVALID_ARG, TAG, "invalid screen text");
-    if (line_count > 10) {
-        line_count = 10;
+    if (line_count > 17) {
+        line_count = 17;
     }
     if (meter_percent < 0) meter_percent = 0;
     if (meter_percent > 100) meter_percent = 100;
@@ -343,11 +344,11 @@ esp_err_t box2_lcd_show_lines(const char *title, const char *const *lines,
                             ESP_ERR_TIMEOUT, TAG, "wait for meter frame");
         draw_meter(meter_percent);
         s_last_meter = meter_percent;
-        return present_region(280, BOX2_LCD_HEIGHT);
+        return present_region(282, BOX2_LCD_HEIGHT);
     }
     ESP_RETURN_ON_ERROR(begin_frame(rgb565(5, 10, 20)), TAG, "wait for dashboard frame");
-    fill_rect(0, 0, BOX2_LCD_WIDTH, 38, rgb565(10, 70, 125));
-    draw_text(8, 9, title, 2, rgb565(255,255,255));
+    fill_rect(0, 0, BOX2_LCD_WIDTH, 23, rgb565(10, 70, 125));
+    draw_text(6, 7, title, 1, rgb565(255,255,255));
     for (size_t i = 0; i < line_count; ++i) {
         uint16_t color = rgb565(225, 235, 245);
         if (strstr(lines[i], " OK") || strstr(lines[i], "PASS")) {
@@ -355,7 +356,10 @@ esp_err_t box2_lcd_show_lines(const char *title, const char *const *lines,
         } else if (strstr(lines[i], "FAIL")) {
             color = rgb565(255, 80, 80);
         }
-        draw_text(8, 50 + (int)i * 23, lines[i], 2, color);
+        if (strstr(lines[i], "WAIT") || strstr(lines[i], "NO CARD")) {
+            color = rgb565(255, 205, 70);
+        }
+        draw_text(6, 28 + (int)i * 15, lines[i], 1, color);
     }
     draw_meter(meter_percent);
     snprintf(s_last_title, sizeof(s_last_title), "%s", title);

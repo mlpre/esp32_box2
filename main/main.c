@@ -5,6 +5,8 @@
 #include "box2_audio.h"
 #include "box2_board.h"
 #include "box2_lcd.h"
+#include "box2_motion.h"
+#include "box2_storage.h"
 #include "esp_chip_info.h"
 #include "esp_check.h"
 #include "esp_event.h"
@@ -105,38 +107,54 @@ static void print_system_info(uint32_t *flash_mb, uint32_t *psram_mb)
 }
 static void update_screen(bool lcd_ok, bool audio_ok, bool board_ok,
                           uint32_t flash_mb, uint32_t psram_mb,
-                          const box2_board_state_t *board, int mic_peak)
+                          const box2_board_state_t *board,
+                          const box2_motion_state_t *motion,
+                          const box2_storage_state_t *storage, int mic_peak)
 {
     if (!lcd_ok) {
         return;
     }
-    char text[10][32];
-    const char *lines[10];
-    for (int i = 0; i < 10; ++i) {
+    char text[17][40];
+    const char *lines[17];
+    for (int i = 0; i < 17; ++i) {
         lines[i] = text[i];
     }
-    snprintf(text[0], sizeof(text[0]), "FLASH %" PRIu32 "M PSRAM %" PRIu32 "M",
+    snprintf(text[0], sizeof(text[0]), "SYS FLASH=%" PRIu32 "M PSRAM=%" PRIu32 "M CPU=240M",
              flash_mb, psram_mb);
     int i2c_count = box2_board_i2c_device_count();
-    bool i2c_ok = board_ok && i2c_count >= 2;
-    snprintf(text[1], sizeof(text[1]), "I2C %s DEV=%d", i2c_ok ? "OK" : "FAIL", i2c_count);
-    snprintf(text[2], sizeof(text[2]), "XIO %s RAW=%04X",
-             board->expander_outputs_ok ? "OK" : "FAIL", board->xio);
-    snprintf(text[3], sizeof(text[3]), "LCD OK 240X320");
-    snprintf(text[4], sizeof(text[4]), "AUDIO %s MIC %s", audio_ok ? "OK" : "FAIL",
-             audio_ok ? "LIVE" : "OFF");
-    snprintf(text[5], sizeof(text[5]), "WIFI %s AP%u %d", s_wifi.scan_ok ? "OK" : "FAIL",
+    bool i2c_ok = board_ok && i2c_count >= 3;
+    snprintf(text[1], sizeof(text[1]), "I2C %s N=%d ADDR=10,19,20", i2c_ok ? "OK" : "FAIL",
+             i2c_count);
+    snprintf(text[2], sizeof(text[2]), "XIO %s RAW=%04X SAFE=%s",
+             board->expander_outputs_ok ? "OK" : "FAIL", board->xio,
+             board->expander_outputs_ok ? "OK" : "FAIL");
+    snprintf(text[3], sizeof(text[3]), "LCD OK 240X320 I80 BL=PWM");
+    snprintf(text[4], sizeof(text[4]), "AUDIO %s MIC=%d %s", audio_ok ? "OK" : "FAIL",
+             mic_peak, audio_ok ? "LIVE" : "OFF");
+    snprintf(text[5], sizeof(text[5]), "WIFI %s AP=%u RSSI=%dDBM", s_wifi.scan_ok ? "OK" : "FAIL",
              s_wifi.ap_count, s_wifi.strongest_rssi);
-    snprintf(text[6], sizeof(text[6]), "BAT %dMV %d%% %s", board->battery_mv_estimate,
-             board->battery_percent, board->charging ? "USB" : "BAT");
-    snprintf(text[7], sizeof(text[7]), "KEY L%d Q%d M%d R%d", board->left_pressed,
-             board->q_pressed, board->middle_pressed, board->right_pressed);
-    snprintf(text[8], sizeof(text[8]), "RAW 5%d 6%d 7%d G%d", board->left_level,
-             board->q_level, board->middle_level, board->right_level);
-    snprintf(text[9], sizeof(text[9]), "L440 Q660 M880 R1K");
+    snprintf(text[6], sizeof(text[6]), "SSID %.31s", s_wifi.strongest_ssid);
+    snprintf(text[7], sizeof(text[7]), "BAT %dMV %d%% %s ADC=%d", board->battery_mv_estimate,
+             board->battery_percent, board->charging ? "USB" : "BAT", board->battery_raw);
+    snprintf(text[8], sizeof(text[8]), "KEY L%d Q%d M%d R%d RAW=%d%d%d%d", board->left_pressed,
+             board->q_pressed, board->middle_pressed, board->right_pressed,
+             board->left_level, board->q_level, board->middle_level, board->right_level);
+    snprintf(text[9], sizeof(text[9]), "ACC %s ID=%02X ORI=%s",
+             motion->detected ? "OK" : "FAIL", motion->who_am_i,
+             motion->orientation ? motion->orientation : "NONE");
+    snprintf(text[10], sizeof(text[10]), "ACC X=%+5dMG RAW=%+6d", motion->x_mg, motion->raw_x);
+    snprintf(text[11], sizeof(text[11]), "ACC Y=%+5dMG RAW=%+6d", motion->y_mg, motion->raw_y);
+    snprintf(text[12], sizeof(text[12]), "ACC Z=%+5dMG RAW=%+6d", motion->z_mg, motion->raw_z);
+    snprintf(text[13], sizeof(text[13]), "SD %s NAME=%s RW=%s",
+             storage->mounted ? "OK" : "NO CARD", storage->name[0] ? storage->name : "-",
+             storage->read_write_ok ? "OK" : "FAIL");
+    snprintf(text[14], sizeof(text[14]), "SD CAP=%" PRIu32 "M FAT=%" PRIu32 "M FREE=%" PRIu32 "M",
+             storage->capacity_mb, storage->total_mb, storage->free_mb);
+    snprintf(text[15], sizeof(text[15]), "SD SPI S17 MO16 MI18 CS15 25M");
+    snprintf(text[16], sizeof(text[16]), "TONE L440 Q660 M880 R1040");
     int meter = mic_peak * 100 / 6000;
     if (meter > 100) meter = 100;
-    esp_err_t err = box2_lcd_show_lines("BOX2 WIFI TEST", lines, 10, meter);
+    esp_err_t err = box2_lcd_show_lines("BOX2 COMPLETE HARDWARE TEST", lines, 17, meter);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "LCD refresh failed: %s", esp_err_to_name(err));
     }
@@ -161,6 +179,15 @@ void app_main(void)
                  board_state.battery_raw, board_state.battery_mv_estimate,
                  board_state.battery_percent, board_state.charging);
     }
+    box2_motion_state_t motion_state = {0};
+    bool motion_ok = board_ok && box2_motion_init(box2_board_i2c_bus()) == ESP_OK;
+    if (motion_ok) {
+        motion_ok = box2_motion_read(&motion_state) == ESP_OK;
+    }
+    ESP_LOGI(TAG, "SC7A20 test: %s", motion_ok ? "PASS" : "FAIL");
+    box2_storage_state_t storage_state = {0};
+    bool storage_ok = box2_storage_test(&storage_state) == ESP_OK;
+    ESP_LOGI(TAG, "TF/MicroSD test: %s", storage_ok ? "PASS" : "FAIL");
     bool audio_ok = board_ok && box2_audio_init(box2_board_i2c_bus()) == ESP_OK;
     ESP_LOGI(TAG, "ES8389/I2S test: %s", audio_ok ? "PASS" : "FAIL");
     if (audio_ok) {
@@ -176,6 +203,7 @@ void app_main(void)
     bool previous_q = board_state.q_pressed;
     TickType_t last_screen = 0;
     TickType_t last_battery = 0;
+    TickType_t last_motion = 0;
     TickType_t last_log = 0;
     int mic_peak = 0;
     ESP_LOGI(TAG, "Interactive mode: L=440Hz, Q=660Hz, M=880Hz, R=1040Hz");
@@ -185,6 +213,12 @@ void app_main(void)
         if (board_ok && box2_board_read_state(&board_state, sample_battery) == ESP_OK &&
             sample_battery) {
             last_battery = now;
+        }
+        if (motion_ok && (now - last_motion) >= pdMS_TO_TICKS(100)) {
+            if (box2_motion_read(&motion_state) != ESP_OK) {
+                motion_state.detected = false;
+            }
+            last_motion = now;
         }
         if (audio_ok) {
             int new_peak = 0;
@@ -214,19 +248,24 @@ void app_main(void)
         previous_middle = board_state.middle_pressed;
         previous_right = board_state.right_pressed;
         previous_q = board_state.q_pressed;
-        if ((now - last_screen) >= pdMS_TO_TICKS(200)) {
+        if ((now - last_screen) >= pdMS_TO_TICKS(400)) {
             update_screen(lcd_ok, audio_ok, board_ok, flash_mb, psram_mb,
-                          &board_state, mic_peak);
+                          &board_state, &motion_state, &storage_state, mic_peak);
             last_screen = now;
         }
         if ((now - last_log) >= pdMS_TO_TICKS(2000)) {
             last_log = now;
-            ESP_LOGI(TAG, "mic=%5d keys=L%d Q%d M%d R%d raw=%d%d%d%d battery=%d%% xio=0x%04X",
+            ESP_LOGI(TAG, "mic=%5d keys=L%d Q%d M%d R%d raw=%d%d%d%d battery=%d%% "
+                     "xio=0x%04X acc=%+d,%+d,%+dmg orient=%s sd=%s rw=%s",
                      mic_peak, board_state.left_pressed, board_state.q_pressed,
                      board_state.middle_pressed, board_state.right_pressed,
                      board_state.left_level, board_state.q_level,
                      board_state.middle_level, board_state.right_level,
-                     board_state.battery_percent, board_state.xio);
+                     board_state.battery_percent, board_state.xio, motion_state.x_mg,
+                     motion_state.y_mg, motion_state.z_mg,
+                     motion_state.orientation ? motion_state.orientation : "NONE",
+                     storage_state.mounted ? "MOUNTED" : "NO_CARD",
+                     storage_state.read_write_ok ? "PASS" : "FAIL");
         }
     }
 }

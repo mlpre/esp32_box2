@@ -10,6 +10,7 @@
 #define BOX2_I2C_SCL                 GPIO_NUM_47
 #define BOX2_ES8389_ADDR_8BIT         0x20
 #define BOX2_TCA9555_ADDR             0x20
+#define BOX2_SC7A20_ADDR              0x19
 #define BOX2_BUTTON_RIGHT            GPIO_NUM_0
 #define BOX2_TCA9555_INT              GPIO_NUM_2
 #define BOX2_XIO_KEY_L                (1U << 5)
@@ -43,3 +44,7 @@
 #define BOX2_LCD_WIDTH                240
 #define BOX2_LCD_HEIGHT               320
 #define BOX2_BATTERY_ADC_CHANNEL      ADC_CHANNEL_0
+#define BOX2_SD_MOSI                  GPIO_NUM_16
+#define BOX2_SD_MISO                  GPIO_NUM_18
+#define BOX2_SD_SCLK                  GPIO_NUM_17
+#define BOX2_SD_CS                    GPIO_NUM_15
