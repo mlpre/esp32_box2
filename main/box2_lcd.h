@@ -35,6 +35,7 @@ typedef struct {
     int countdown;
     int tilt_mg;
     int steering_axis;
+    int steering_sign;
     bool steering_ready;
     bool muted;
     box2_game_traffic_t traffic[BOX2_GAME_TRAFFIC_MAX];

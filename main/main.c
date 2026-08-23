@@ -1,7 +1,6 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 #include "box2_audio.h"
 #include "box2_board.h"
@@ -66,6 +65,7 @@ static void start_race(race_game_t *game, TickType_t now)
     int tilt = game->view.tilt_mg;
     bool steering_ready = game->view.steering_ready;
     int steering_axis = game->view.steering_axis;
+    int steering_sign = game->view.steering_sign;
     memset(&game->view, 0, sizeof(game->view));
     game->view.screen = BOX2_GAME_COUNTDOWN;
     game->view.countdown = 3;
@@ -75,6 +75,7 @@ static void start_race(race_game_t *game, TickType_t now)
     game->view.tilt_mg = tilt;
     game->view.steering_ready = steering_ready;
     game->view.steering_axis = steering_axis;
+    game->view.steering_sign = steering_sign;
     game->distance_exact = 0.0f;
     game->lateral_velocity = 0.0f;
     game->curve_target = 0.0f;
@@ -220,33 +221,27 @@ static void calibrate_motion(race_game_t *game, box2_motion_state_t *motion)
     }
     ESP_LOGI(TAG, "tilt center calibrated: x=%d y=%d z=%d mg",
              game->center_x_mg, game->center_y_mg, game->center_z_mg);
+    game->steering_axis = 0;
+    game->steering_sign = 1;
+    game->view.steering_axis = 0;
+    game->view.steering_sign = 1;
+    game->view.steering_ready = true;
+    ESP_LOGI(TAG, "steering defaults to screen horizontal axis X+");
 }
 
-static void detect_steering_axis(race_game_t *game, const box2_motion_state_t *motion)
+static void cycle_steering_axis(race_game_t *game)
 {
-    if (game->view.steering_ready) return;
-    const int delta[3] = {
-        motion->x_mg - game->center_x_mg,
-        motion->y_mg - game->center_y_mg,
-        motion->z_mg - game->center_z_mg,
-    };
-    int axis = 0;
-    int magnitude = abs(delta[0]);
-    for (int i = 1; i < 3; ++i) {
-        if (abs(delta[i]) > magnitude) {
-            axis = i;
-            magnitude = abs(delta[i]);
-        }
-    }
-    if (magnitude < 150) return;
-    game->steering_axis = axis;
-    game->steering_sign = delta[axis] > 0 ? -1 : 1;
+    int mode = game->steering_axis * 2 + (game->steering_sign < 0 ? 1 : 0);
+    mode = (mode + 1) % 6;
+    game->steering_axis = mode / 2;
+    game->steering_sign = (mode & 1) ? -1 : 1;
     game->filtered_steer_mg = 0.0f;
-    game->view.steering_axis = axis;
+    game->view.steering_axis = game->steering_axis;
+    game->view.steering_sign = game->steering_sign;
     game->view.steering_ready = true;
-    ESP_LOGI(TAG, "steering calibrated from LEFT tilt: axis=%c sign=%d delta=%d mg",
-             "XYZ"[axis], game->steering_sign, delta[axis]);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_START));
+    ESP_LOGI(TAG, "steering selection: %c%c", "XYZ"[game->steering_axis],
+             game->steering_sign > 0 ? '+' : '-');
+    ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_MENU));
 }
 
 void app_main(void)
@@ -289,9 +284,6 @@ void app_main(void)
             continue;
         }
         if (box2_motion_read(&motion) != ESP_OK) motion.detected = false;
-        if (game.view.screen == BOX2_GAME_TITLE && motion.detected) {
-            detect_steering_axis(&game, &motion);
-        }
         bool left_edge = keys.left_pressed && !previous.left_pressed;
         bool right_edge = keys.right_pressed && !previous.right_pressed;
         bool middle_edge = keys.middle_pressed && !previous.middle_pressed;
@@ -300,7 +292,10 @@ void app_main(void)
 
         if (left_edge) set_volume(&game, game.view.volume - 10);
         if (right_edge) set_volume(&game, game.view.volume + 10);
-        if (q_edge && game.view.steering_ready) start_race(&game, now);
+        if (q_edge) {
+            if (game.view.screen == BOX2_GAME_TITLE) cycle_steering_axis(&game);
+            else start_race(&game, now);
+        }
         if (middle_edge) {
             if (game.view.screen == BOX2_GAME_TITLE && !game.view.steering_ready) {
                 ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_effect(BOX2_SFX_MENU));
