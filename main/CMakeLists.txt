@@ -1,0 +1,20 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "box2_audio.c"
+        "box2_board.c"
+        "box2_lcd.c"
+    INCLUDE_DIRS "."
+    PRIV_REQUIRES
+        esp_adc
+        esp_driver_gpio
+        esp_driver_i2c
+        esp_driver_i2s
+        esp_driver_ledc
+        esp_event
+        esp_lcd
+        esp_netif
+        esp_wifi
+        nvs_flash
+        spi_flash
+)
