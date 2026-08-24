@@ -1,26 +1,14 @@
 idf_component_register(
     SRCS
         "main.c"
-        "box2_audio.c"
-        "box2_board.c"
-        "box2_lcd.c"
-        "box2_motion.c"
-        "box2_storage.c"
+        "hardware_test_screen.c"
+        "hardware_test_utils.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
-        esp_adc
-        esp_driver_gpio
-        esp_driver_i2c
-        esp_driver_i2s
-        esp_driver_ledc
-        esp_driver_sdspi
-        esp_driver_spi
+        driver
         esp_event
-        fatfs
-        esp_lcd
         esp_netif
         esp_wifi
         nvs_flash
-        sdmmc
         spi_flash
 )

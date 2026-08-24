@@ -16,6 +16,11 @@ static esp_codec_dev_handle_t s_output_dev;
 static esp_codec_dev_handle_t s_input_dev;
 esp_err_t box2_audio_init(i2c_master_bus_handle_t i2c_bus)
 {
+    if (s_output_dev && s_input_dev)
+    {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_FALSE(i2c_bus, ESP_ERR_INVALID_ARG, TAG, "I2C bus is null");
     i2s_chan_config_t channel_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
     channel_cfg.auto_clear_after_cb = true;
     ESP_RETURN_ON_ERROR(i2s_new_channel(&channel_cfg, &s_tx_channel, &s_rx_channel),
@@ -23,7 +28,7 @@ esp_err_t box2_audio_init(i2c_master_bus_handle_t i2c_bus)
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(BOX2_AUDIO_SAMPLE_RATE),
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
-                                                       I2S_SLOT_MODE_STEREO),
+                                                        I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
             .mclk = BOX2_I2S_MCLK,
             .bclk = BOX2_I2S_BCLK,
@@ -118,52 +123,44 @@ esp_err_t box2_audio_init(i2c_master_bus_handle_t i2c_bus)
              chip_id0 & 0xff, chip_id1 & 0xff);
     return ESP_OK;
 }
-esp_err_t box2_audio_play_tone(int frequency_hz, int duration_ms)
+esp_err_t box2_audio_set_output_volume(int volume_percent)
 {
-    if (!s_output_dev || frequency_hz <= 0 || duration_ms <= 0) {
+    if (!s_output_dev || volume_percent < 0 || volume_percent > 100)
+    {
         return ESP_ERR_INVALID_ARG;
     }
-    enum { FRAME_SAMPLES = 240 };
-    int16_t samples[FRAME_SAMPLES];
-    uint32_t phase = 0;
-    const uint32_t phase_step = ((uint64_t)(uint32_t)frequency_hz << 32) /
-                                BOX2_AUDIO_SAMPLE_RATE;
-    int frames = (duration_ms * BOX2_AUDIO_SAMPLE_RATE + FRAME_SAMPLES * 1000 - 1) /
-                 (FRAME_SAMPLES * 1000);
-    ESP_RETURN_ON_ERROR(esp_codec_dev_set_out_vol(s_output_dev, 65), TAG, "enable test tone");
-    for (int frame = 0; frame < frames; ++frame) {
-        for (int i = 0; i < FRAME_SAMPLES; ++i) {
-            uint16_t p = (uint16_t)(phase >> 16);
-            int32_t triangle = p < 32768 ? (int32_t)p : (int32_t)(65535 - p);
-            samples[i] = (int16_t)((triangle - 16384) / 3);
-            phase += phase_step;
-        }
-        int err = esp_codec_dev_write(s_output_dev, samples, sizeof(samples));
-        if (err != ESP_OK) {
-            return err;
-        }
-    }
-    return esp_codec_dev_set_out_vol(s_output_dev, 0);
+    return esp_codec_dev_set_out_vol(s_output_dev, volume_percent);
 }
-esp_err_t box2_audio_read_peak(int *peak)
+
+esp_err_t box2_audio_set_input_gain(float gain_db)
 {
-    if (!s_input_dev || !peak) {
+    if (!s_input_dev)
+    {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return esp_codec_dev_set_in_gain(s_input_dev, gain_db);
+}
+
+esp_err_t box2_audio_write(const int16_t *samples, size_t sample_count)
+{
+    if (!s_output_dev || !samples || sample_count == 0)
+    {
         return ESP_ERR_INVALID_ARG;
     }
-    int16_t samples[240];
-    int err = esp_codec_dev_read(s_input_dev, samples, sizeof(samples));
-    if (err != ESP_OK) {
-        return err;
+    return esp_codec_dev_write(s_output_dev, (void *)samples,
+                               sample_count * sizeof(*samples));
+}
+
+esp_err_t box2_audio_read(int16_t *samples, size_t sample_count)
+{
+    if (!s_input_dev || !samples || sample_count == 0)
+    {
+        return ESP_ERR_INVALID_ARG;
     }
-    int minimum = INT16_MAX;
-    int maximum = INT16_MIN;
-    for (size_t i = 0; i < sizeof(samples) / sizeof(samples[0]); ++i) {
-        int value = samples[i];
-        if (value < minimum) minimum = value;
-        if (value > maximum) {
-            maximum = value;
-        }
-    }
-    *peak = (maximum - minimum) / 2;
-    return ESP_OK;
+    return esp_codec_dev_read(s_input_dev, samples, sample_count * sizeof(*samples));
+}
+
+uint32_t box2_audio_sample_rate(void)
+{
+    return BOX2_AUDIO_SAMPLE_RATE;
 }

@@ -1,7 +1,34 @@
-# ATK-DNESP32S3-BOX2-WIFI 全硬件测试 Demo
+# ATK-DNESP32S3-BOX2-WIFI 通用驱动与硬件测试
 
-这是一个独立的 ESP-IDF 板级测试程序，适配 `xiaozhi-esp32` PR #954 中的
-`ATK-DNESP32S3-BOX2-WIFI`。它不包含小智业务逻辑，只用于确认板载硬件和引脚连接。
+工程分为根目录下可复用的 ESP-IDF 驱动组件 `driver` 和独立的硬件测试应用 `main`，适配
+`xiaozhi-esp32` PR #954 中的 `ATK-DNESP32S3-BOX2-WIFI`。驱动不依赖测试面板、提示音、
+Wi-Fi 扫描或临时测试文件，可以直接复制到其他 ESP-IDF 工程使用。
+
+## 驱动库调用
+
+将 `driver` 复制到目标工程根目录，并通过 `EXTRA_COMPONENT_DIRS` 注册；在应用组件的
+`CMakeLists.txt` 中加入 `PRIV_REQUIRES driver`，然后通过聚合头文件调用：
+
+```c
+#include "box2.h"
+
+ESP_ERROR_CHECK(box2_board_init());
+ESP_ERROR_CHECK(box2_motion_init(box2_board_i2c_bus()));
+
+box2_motion_state_t motion = {0};
+ESP_ERROR_CHECK(box2_motion_read(&motion));
+```
+
+公开接口按硬件拆分：
+
+- `box2_board_*`：共享 I2C、TCA9555、按键和电池状态
+- `box2_audio_*`：PCM 采集/播放、输出音量和输入增益
+- `box2_lcd_*`：LCD 初始化、背光和 RGB565 位图绘制
+- `box2_motion_*`：SC7A20 初始化和三轴采样
+- `box2_storage_*`：TF 卡挂载、容量刷新、挂载点和卸载
+
+`main/hardware_test_utils.*` 中的提示音、麦克风峰值、SD 读写校验，以及
+`main/hardware_test_screen.*` 中的色条和测试面板，均属于测试层，不会链接进驱动库。
 
 ## 已覆盖的硬件
 
@@ -61,7 +88,7 @@ idf.py build
 构建过程会自动完成以下工作：
 
 1. 根据 `sdkconfig.defaults` 生成 `sdkconfig`。
-2. 根据 `main/idf_component.yml` 解析并下载 `espressif/esp_codec_dev`，同时生成 `dependencies.lock`。
+2. 根据 `driver/idf_component.yml` 解析并下载 `espressif/esp_codec_dev`，同时生成 `dependencies.lock`。
 3. 在 `build` 中生成 Bootloader、分区表和应用固件。
 
 成功时最后会出现 `Project build complete`。主要输出为：
@@ -145,12 +172,10 @@ idf.py fullclean
 
 ## 主要文件
 
-- `main/box2_config.h`：完整板级引脚定义
-- `main/box2_board.c`：I2C、TCA9555、按键、电池 ADC
-- `main/box2_lcd.c`：ST7789、8080 总线、背光和测试 UI
-- `main/box2_audio.c`：ES8389、I2S、扬声器和麦克风
-- `main/box2_motion.c`：SC7A20 初始化、XYZ 采样、mg 换算和方向判断
-- `main/box2_storage.c`：TF 卡 SPI3、FAT 挂载、容量和文件读写校验
+- `driver/*.h`：稳定的公开 API 和板级配置
+- `driver/*.c`：音频、板级 IO、LCD、运动和存储驱动实现
+- `main/hardware_test_utils.c`：提示音、麦克风峰值和 TF 卡读写测试
+- `main/hardware_test_screen.c`：测试专用色条和实时状态面板
 - `main/main.c`：启动自检、Wi-Fi 扫描和交互循环
 
 ## 干净源码目录
@@ -163,21 +188,28 @@ esp32_box2/
 ├─ CMakeLists.txt
 ├─ README.md
 ├─ sdkconfig.defaults
+├─ driver/
+│  ├─ CMakeLists.txt
+│  ├─ idf_component.yml
+│  ├─ box2.h
+│  ├─ box2_config.h
+│  ├─ box2_board.c
+│  ├─ box2_board.h
+│  ├─ box2_audio.c
+│  ├─ box2_audio.h
+│  ├─ box2_motion.c
+│  ├─ box2_motion.h
+│  ├─ box2_storage.c
+│  ├─ box2_storage.h
+│  ├─ box2_lcd.c
+│  └─ box2_lcd.h
 └─ main/
    ├─ CMakeLists.txt
-   ├─ idf_component.yml
    ├─ main.c
-   ├─ box2_config.h
-   ├─ box2_board.c
-   ├─ box2_board.h
-   ├─ box2_audio.c
-   ├─ box2_audio.h
-   ├─ box2_motion.c
-   ├─ box2_motion.h
-   ├─ box2_storage.c
-   ├─ box2_storage.h
-   ├─ box2_lcd.c
-   └─ box2_lcd.h
+   ├─ hardware_test_utils.c
+   ├─ hardware_test_utils.h
+   ├─ hardware_test_screen.c
+   └─ hardware_test_screen.h
 ```
 
 `build/`、`managed_components/`、`sdkconfig` 和 `dependencies.lock` 都是构建时自动生成的内容，

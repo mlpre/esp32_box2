@@ -2,11 +2,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "box2_audio.h"
-#include "box2_board.h"
-#include "box2_lcd.h"
-#include "box2_motion.h"
-#include "box2_storage.h"
+#include "box2.h"
 #include "esp_chip_info.h"
 #include "esp_check.h"
 #include "esp_event.h"
@@ -17,9 +13,12 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "hardware_test_screen.h"
+#include "hardware_test_utils.h"
 #include "nvs_flash.h"
 static const char *TAG = "box2_demo";
-typedef struct {
+typedef struct
+{
     bool initialized;
     bool scan_ok;
     uint16_t ap_count;
@@ -30,7 +29,8 @@ static wifi_test_state_t s_wifi;
 static esp_err_t wifi_test_init(void)
 {
     esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
         ESP_RETURN_ON_ERROR(nvs_flash_erase(), TAG, "erase NVS");
         err = nvs_flash_init();
     }
@@ -47,7 +47,8 @@ static esp_err_t wifi_test_init(void)
 }
 static esp_err_t wifi_test_scan(void)
 {
-    if (!s_wifi.initialized) {
+    if (!s_wifi.initialized)
+    {
         return ESP_ERR_INVALID_STATE;
     }
     const wifi_scan_config_t scan_config = {
@@ -64,7 +65,8 @@ static esp_err_t wifi_test_scan(void)
     };
     ESP_LOGI(TAG, "Scanning 2.4 GHz Wi-Fi...");
     esp_err_t err = esp_wifi_scan_start(&scan_config, true);
-    if (err != ESP_OK) {
+    if (err != ESP_OK)
+    {
         s_wifi.scan_ok = false;
         return err;
     }
@@ -74,7 +76,8 @@ static esp_err_t wifi_test_scan(void)
     wifi_ap_record_t *records = calloc(read_count ? read_count : 1, sizeof(*records));
     ESP_RETURN_ON_FALSE(records, ESP_ERR_NO_MEM, TAG, "allocate AP records");
     err = esp_wifi_scan_get_ap_records(&read_count, records);
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         s_wifi.ap_count = count;
         s_wifi.strongest_rssi = read_count ? records[0].rssi : -127;
         snprintf(s_wifi.strongest_ssid, sizeof(s_wifi.strongest_ssid), "%s",
@@ -82,11 +85,14 @@ static esp_err_t wifi_test_scan(void)
         s_wifi.scan_ok = true;
         ESP_LOGI(TAG, "Wi-Fi scan PASS: %u AP(s), strongest '%s' (%d dBm)",
                  count, s_wifi.strongest_ssid, s_wifi.strongest_rssi);
-        for (uint16_t i = 0; i < read_count && i < 10; ++i) {
+        for (uint16_t i = 0; i < read_count && i < 10; ++i)
+        {
             ESP_LOGI(TAG, "  %2u  ch=%2u  rssi=%4d  %s", i + 1, records[i].primary,
                      records[i].rssi, records[i].ssid);
         }
-    } else {
+    }
+    else
+    {
         s_wifi.scan_ok = false;
     }
     free(records);
@@ -109,14 +115,17 @@ static void update_screen(bool lcd_ok, bool audio_ok, bool board_ok,
                           uint32_t flash_mb, uint32_t psram_mb,
                           const box2_board_state_t *board,
                           const box2_motion_state_t *motion,
-                          const box2_storage_state_t *storage, int mic_peak)
+                          const hardware_test_storage_result_t *storage_test,
+                          int mic_peak)
 {
-    if (!lcd_ok) {
+    if (!lcd_ok)
+    {
         return;
     }
     char text[17][40];
     const char *lines[17];
-    for (int i = 0; i < 17; ++i) {
+    for (int i = 0; i < 17; ++i)
+    {
         lines[i] = text[i];
     }
     snprintf(text[0], sizeof(text[0]), "SYS FLASH=%" PRIu32 "M PSRAM=%" PRIu32 "M CPU=240M",
@@ -145,17 +154,21 @@ static void update_screen(bool lcd_ok, bool audio_ok, bool board_ok,
     snprintf(text[10], sizeof(text[10]), "ACC X=%+5dMG RAW=%+6d", motion->x_mg, motion->raw_x);
     snprintf(text[11], sizeof(text[11]), "ACC Y=%+5dMG RAW=%+6d", motion->y_mg, motion->raw_y);
     snprintf(text[12], sizeof(text[12]), "ACC Z=%+5dMG RAW=%+6d", motion->z_mg, motion->raw_z);
+    const box2_storage_state_t *storage = &storage_test->storage;
     snprintf(text[13], sizeof(text[13]), "SD %s NAME=%s RW=%s",
              storage->mounted ? "OK" : "NO CARD", storage->name[0] ? storage->name : "-",
-             storage->read_write_ok ? "OK" : "FAIL");
+             storage_test->read_write_ok ? "OK" : "FAIL");
     snprintf(text[14], sizeof(text[14]), "SD CAP=%" PRIu32 "M FAT=%" PRIu32 "M FREE=%" PRIu32 "M",
              storage->capacity_mb, storage->total_mb, storage->free_mb);
     snprintf(text[15], sizeof(text[15]), "SD SPI S17 MO16 MI18 CS15 25M");
     snprintf(text[16], sizeof(text[16]), "TONE L440 Q660 M880 R1040");
     int meter = mic_peak * 100 / 6000;
-    if (meter > 100) meter = 100;
-    esp_err_t err = box2_lcd_show_lines("BOX2 COMPLETE HARDWARE TEST", lines, 17, meter);
-    if (err != ESP_OK) {
+    if (meter > 100)
+        meter = 100;
+    esp_err_t err = hardware_test_screen_show_lines(
+        "BOX2 COMPLETE HARDWARE TEST", lines, 17, meter);
+    if (err != ESP_OK)
+    {
         ESP_LOGW(TAG, "LCD refresh failed: %s", esp_err_to_name(err));
     }
 }
@@ -165,15 +178,36 @@ void app_main(void)
     uint32_t psram_mb = 0;
     print_system_info(&flash_mb, &psram_mb);
     bool board_ok = box2_board_init() == ESP_OK;
+    size_t i2c_count = 0;
+    uint8_t i2c_addresses[16];
+    if (board_ok)
+    {
+        esp_err_t scan_err = box2_board_i2c_scan(i2c_addresses,
+                                                 sizeof(i2c_addresses), &i2c_count);
+        board_ok = scan_err == ESP_OK;
+        ESP_LOGI(TAG, "I2C scan found %u device(s)", (unsigned)i2c_count);
+        size_t listed_count = i2c_count < sizeof(i2c_addresses) ? i2c_count : sizeof(i2c_addresses);
+        for (size_t i = 0; i < listed_count; ++i)
+        {
+            ESP_LOGI(TAG, "  device @ 0x%02X", i2c_addresses[i]);
+        }
+    }
     ESP_LOGI(TAG, "I2C/TCA9555 test: %s", board_ok ? "PASS" : "FAIL");
     bool lcd_ok = box2_lcd_init() == ESP_OK;
     ESP_LOGI(TAG, "LCD/backlight test: %s", lcd_ok ? "PASS" : "FAIL");
-    if (lcd_ok) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_lcd_show_color_test());
+    if (lcd_ok)
+    {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_lcd_set_backlight(13));
+        vTaskDelay(pdMS_TO_TICKS(120));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_lcd_set_backlight(50));
+        vTaskDelay(pdMS_TO_TICKS(120));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_lcd_set_backlight(100));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_screen_show_color_bars());
         vTaskDelay(pdMS_TO_TICKS(900));
     }
     box2_board_state_t board_state = {0};
-    if (board_ok) {
+    if (board_ok)
+    {
         ESP_ERROR_CHECK_WITHOUT_ABORT(box2_board_read_state(&board_state, true));
         ESP_LOGI(TAG, "battery raw=%d estimate=%d mV level=%d%% charging=%d",
                  board_state.battery_raw, board_state.battery_mv_estimate,
@@ -181,19 +215,21 @@ void app_main(void)
     }
     box2_motion_state_t motion_state = {0};
     bool motion_ok = board_ok && box2_motion_init(box2_board_i2c_bus()) == ESP_OK;
-    if (motion_ok) {
+    if (motion_ok)
+    {
         motion_ok = box2_motion_read(&motion_state) == ESP_OK;
     }
     ESP_LOGI(TAG, "SC7A20 test: %s", motion_ok ? "PASS" : "FAIL");
-    box2_storage_state_t storage_state = {0};
-    bool storage_ok = box2_storage_test(&storage_state) == ESP_OK;
+    hardware_test_storage_result_t storage_test = {0};
+    bool storage_ok = hardware_test_storage(&storage_test) == ESP_OK;
     ESP_LOGI(TAG, "TF/MicroSD test: %s", storage_ok ? "PASS" : "FAIL");
     bool audio_ok = board_ok && box2_audio_init(box2_board_i2c_bus()) == ESP_OK;
     ESP_LOGI(TAG, "ES8389/I2S test: %s", audio_ok ? "PASS" : "FAIL");
-    if (audio_ok) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_tone(523, 180));
+    if (audio_ok)
+    {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_audio_play_tone(523, 180));
         vTaskDelay(pdMS_TO_TICKS(80));
-        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_tone(784, 220));
+        ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_audio_play_tone(784, 220));
     }
     bool wifi_ok = wifi_test_init() == ESP_OK && wifi_test_scan() == ESP_OK;
     ESP_LOGI(TAG, "Wi-Fi radio test: %s", wifi_ok ? "PASS" : "FAIL");
@@ -207,56 +243,70 @@ void app_main(void)
     TickType_t last_log = 0;
     int mic_peak = 0;
     ESP_LOGI(TAG, "Interactive mode: L=440Hz, Q=660Hz, M=880Hz, R=1040Hz");
-    while (true) {
+    while (true)
+    {
         TickType_t now = xTaskGetTickCount();
         bool sample_battery = (now - last_battery) >= pdMS_TO_TICKS(5000);
         if (board_ok && box2_board_read_state(&board_state, sample_battery) == ESP_OK &&
-            sample_battery) {
+            sample_battery)
+        {
             last_battery = now;
         }
-        if (motion_ok && (now - last_motion) >= pdMS_TO_TICKS(100)) {
-            if (box2_motion_read(&motion_state) != ESP_OK) {
+        if (motion_ok && (now - last_motion) >= pdMS_TO_TICKS(100))
+        {
+            if (box2_motion_read(&motion_state) != ESP_OK)
+            {
                 motion_state.detected = false;
             }
             last_motion = now;
         }
-        if (audio_ok) {
+        if (audio_ok)
+        {
             int new_peak = 0;
-            if (box2_audio_read_peak(&new_peak) == ESP_OK) {
+            if (hardware_test_audio_read_peak(&new_peak) == ESP_OK)
+            {
                 mic_peak = new_peak;
             }
-        } else {
+        }
+        else
+        {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
-        if (board_state.left_pressed && !previous_left && audio_ok) {
+        if (board_state.left_pressed && !previous_left && audio_ok)
+        {
             ESP_LOGI(TAG, "LEFT key: speaker 440 Hz");
-            ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_tone(440, 180));
+            ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_audio_play_tone(440, 180));
         }
-        if (board_state.middle_pressed && !previous_middle && audio_ok) {
+        if (board_state.middle_pressed && !previous_middle && audio_ok)
+        {
             ESP_LOGI(TAG, "MIDDLE key: speaker 880 Hz");
-            ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_tone(880, 180));
+            ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_audio_play_tone(880, 180));
         }
-        if (board_state.q_pressed && !previous_q && audio_ok) {
+        if (board_state.q_pressed && !previous_q && audio_ok)
+        {
             ESP_LOGI(TAG, "Q key: speaker 660 Hz");
-            ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_tone(660, 180));
+            ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_audio_play_tone(660, 180));
         }
-        if (board_state.right_pressed && !previous_right && audio_ok) {
+        if (board_state.right_pressed && !previous_right && audio_ok)
+        {
             ESP_LOGI(TAG, "RIGHT key: speaker 1040 Hz");
-            ESP_ERROR_CHECK_WITHOUT_ABORT(box2_audio_play_tone(1040, 180));
+            ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_audio_play_tone(1040, 180));
         }
         previous_left = board_state.left_pressed;
         previous_middle = board_state.middle_pressed;
         previous_right = board_state.right_pressed;
         previous_q = board_state.q_pressed;
-        if ((now - last_screen) >= pdMS_TO_TICKS(400)) {
+        if ((now - last_screen) >= pdMS_TO_TICKS(400))
+        {
             update_screen(lcd_ok, audio_ok, board_ok, flash_mb, psram_mb,
-                          &board_state, &motion_state, &storage_state, mic_peak);
+                          &board_state, &motion_state, &storage_test, mic_peak);
             last_screen = now;
         }
-        if ((now - last_log) >= pdMS_TO_TICKS(2000)) {
+        if ((now - last_log) >= pdMS_TO_TICKS(2000))
+        {
             last_log = now;
             ESP_LOGI(TAG, "mic=%5d keys=L%d Q%d M%d R%d raw=%d%d%d%d battery=%d%% "
-                     "xio=0x%04X acc=%+d,%+d,%+dmg orient=%s sd=%s rw=%s",
+                          "xio=0x%04X acc=%+d,%+d,%+dmg orient=%s sd=%s rw=%s",
                      mic_peak, board_state.left_pressed, board_state.q_pressed,
                      board_state.middle_pressed, board_state.right_pressed,
                      board_state.left_level, board_state.q_level,
@@ -264,8 +314,8 @@ void app_main(void)
                      board_state.battery_percent, board_state.xio, motion_state.x_mg,
                      motion_state.y_mg, motion_state.z_mg,
                      motion_state.orientation ? motion_state.orientation : "NONE",
-                     storage_state.mounted ? "MOUNTED" : "NO_CARD",
-                     storage_state.read_write_ok ? "PASS" : "FAIL");
+                     storage_test.storage.mounted ? "MOUNTED" : "NO_CARD",
+                     storage_test.read_write_ok ? "PASS" : "FAIL");
         }
     }
 }

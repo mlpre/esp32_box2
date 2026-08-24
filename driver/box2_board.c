@@ -6,9 +6,9 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#define TCA9555_REG_INPUT0   0x00
-#define TCA9555_REG_OUTPUT0  0x02
-#define TCA9555_REG_CONFIG0  0x06
+#define TCA9555_REG_INPUT0 0x00
+#define TCA9555_REG_OUTPUT0 0x02
+#define TCA9555_REG_CONFIG0 0x06
 static const char *TAG = "box2_board";
 static i2c_master_bus_handle_t s_i2c_bus;
 static i2c_master_dev_handle_t s_tca9555;
@@ -27,27 +27,38 @@ static esp_err_t tca_read_u16(uint8_t reg, uint16_t *value)
 {
     uint8_t data[2] = {0};
     esp_err_t err = i2c_master_transmit_receive(s_tca9555, &reg, 1, data, sizeof(data), 100);
-    if (err == ESP_OK) {
+    if (err == ESP_OK)
+    {
         *value = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
     }
     return err;
 }
 static int battery_percent_from_raw(int raw)
 {
-    static const struct {
+    static const struct
+    {
         int raw;
         int percent;
     } levels[] = {
-        {2696, 0}, {2724, 20}, {2861, 40}, {3038, 60}, {3150, 80}, {3280, 100},
+        {2696, 0},
+        {2724, 20},
+        {2861, 40},
+        {3038, 60},
+        {3150, 80},
+        {3280, 100},
     };
-    if (raw <= levels[0].raw) {
+    if (raw <= levels[0].raw)
+    {
         return 0;
     }
-    if (raw >= levels[5].raw) {
+    if (raw >= levels[5].raw)
+    {
         return 100;
     }
-    for (int i = 0; i < 5; ++i) {
-        if (raw < levels[i + 1].raw) {
+    for (int i = 0; i < 5; ++i)
+    {
+        if (raw < levels[i + 1].raw)
+        {
             return levels[i].percent +
                    (raw - levels[i].raw) * (levels[i + 1].percent - levels[i].percent) /
                        (levels[i + 1].raw - levels[i].raw);
@@ -57,20 +68,30 @@ static int battery_percent_from_raw(int raw)
 }
 static int battery_mv_from_raw(int raw)
 {
-    static const struct {
+    static const struct
+    {
         int raw;
         int mv;
     } levels[] = {
-        {2696, 3480}, {2724, 3530}, {2861, 3700}, {3038, 3900}, {3150, 4020}, {3280, 4140},
+        {2696, 3480},
+        {2724, 3530},
+        {2861, 3700},
+        {3038, 3900},
+        {3150, 4020},
+        {3280, 4140},
     };
-    if (raw <= levels[0].raw) {
+    if (raw <= levels[0].raw)
+    {
         return levels[0].mv;
     }
-    if (raw >= levels[5].raw) {
+    if (raw >= levels[5].raw)
+    {
         return levels[5].mv;
     }
-    for (int i = 0; i < 5; ++i) {
-        if (raw < levels[i + 1].raw) {
+    for (int i = 0; i < 5; ++i)
+    {
+        if (raw < levels[i + 1].raw)
+        {
             return levels[i].mv +
                    (raw - levels[i].raw) * (levels[i + 1].mv - levels[i].mv) /
                        (levels[i + 1].raw - levels[i].raw);
@@ -90,15 +111,18 @@ static esp_err_t read_battery(int *raw)
     int total = 0;
     int sample = 0;
     esp_err_t err = ESP_OK;
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < 16; ++i)
+    {
         err = adc_oneshot_read(s_adc, BOX2_BATTERY_ADC_CHANNEL, &sample);
-        if (err != ESP_OK) {
+        if (err != ESP_OK)
+        {
             break;
         }
         total += sample;
     }
     esp_err_t restore_err = tca_write_u16(TCA9555_REG_CONFIG0, BOX2_XIO_INPUT_MASK);
-    if (err == ESP_OK && restore_err == ESP_OK) {
+    if (err == ESP_OK && restore_err == ESP_OK)
+    {
         *raw = total / 16;
         return ESP_OK;
     }
@@ -106,6 +130,10 @@ static esp_err_t read_battery(int *raw)
 }
 esp_err_t box2_board_init(void)
 {
+    if (s_i2c_bus)
+    {
+        return ESP_OK;
+    }
     const i2c_master_bus_config_t bus_cfg = {
         .i2c_port = I2C_NUM_0,
         .sda_io_num = BOX2_I2C_SDA,
@@ -129,16 +157,6 @@ esp_err_t box2_board_init(void)
     ESP_RETURN_ON_ERROR(tca_write_u16(TCA9555_REG_CONFIG0, BOX2_XIO_INPUT_MASK),
                         TAG, "configure expander directions");
     s_i2c_device_count = 0;
-    ESP_LOGI(TAG, "I2C scan:");
-    for (uint8_t address = 1; address < 0x7f; ++address) {
-        if (i2c_master_probe(s_i2c_bus, address, 20) == ESP_OK) {
-            ESP_LOGI(TAG, "  device @ 0x%02X%s", address,
-                     address == 0x10 ? " (ES8389)" :
-                     address == BOX2_SC7A20_ADDR ? " (SC7A20)" :
-                     address == BOX2_TCA9555_ADDR ? " (TCA9555)" : "");
-            ++s_i2c_device_count;
-        }
-    }
     const gpio_config_t key_cfg = {
         .pin_bit_mask = (1ULL << BOX2_BUTTON_RIGHT) | (1ULL << BOX2_TCA9555_INT),
         .mode = GPIO_MODE_INPUT,
@@ -151,7 +169,8 @@ esp_err_t box2_board_init(void)
     int q_high = 0;
     int m_high = 0;
     int r_high = 0;
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < 16; ++i)
+    {
         uint16_t keys = 0;
         ESP_RETURN_ON_ERROR(tca_read_u16(TCA9555_REG_INPUT0, &keys), TAG,
                             "calibrate key idle levels");
@@ -189,6 +208,27 @@ int box2_board_i2c_device_count(void)
 {
     return s_i2c_device_count;
 }
+
+esp_err_t box2_board_i2c_scan(uint8_t *addresses, size_t capacity, size_t *count)
+{
+    ESP_RETURN_ON_FALSE(s_i2c_bus && count, ESP_ERR_INVALID_ARG, TAG,
+                        "invalid I2C scan arguments");
+    size_t found = 0;
+    for (uint8_t address = 1; address < 0x7f; ++address)
+    {
+        if (i2c_master_probe(s_i2c_bus, address, 20) == ESP_OK)
+        {
+            if (addresses && found < capacity)
+            {
+                addresses[found] = address;
+            }
+            ++found;
+        }
+    }
+    *count = found;
+    s_i2c_device_count = (int)found;
+    return found > capacity && addresses ? ESP_ERR_INVALID_SIZE : ESP_OK;
+}
 esp_err_t box2_board_read_state(box2_board_state_t *state, bool sample_battery)
 {
     ESP_RETURN_ON_FALSE(state, ESP_ERR_INVALID_ARG, TAG, "state is null");
@@ -206,7 +246,8 @@ esp_err_t box2_board_read_state(box2_board_state_t *state, bool sample_battery)
     state->right_pressed = state->right_level != s_key_r_idle;
     state->expander_outputs_ok =
         (xio & BOX2_XIO_OUTPUT_MASK) == (BOX2_XIO_SAFE_OUTPUTS & BOX2_XIO_OUTPUT_MASK);
-    if (sample_battery) {
+    if (sample_battery)
+    {
         int raw = 0;
         ESP_RETURN_ON_ERROR(read_battery(&raw), TAG, "sample battery");
         state->battery_raw = raw;

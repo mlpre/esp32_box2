@@ -1,9 +1,11 @@
 #pragma once
+#include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include "driver/i2c_master.h"
 #include "esp_err.h"
-typedef struct {
+typedef struct
+{
     uint16_t xio;
     int battery_raw;
     int battery_percent;
@@ -22,4 +24,5 @@ typedef struct {
 esp_err_t box2_board_init(void);
 i2c_master_bus_handle_t box2_board_i2c_bus(void);
 int box2_board_i2c_device_count(void);
+esp_err_t box2_board_i2c_scan(uint8_t *addresses, size_t capacity, size_t *count);
 esp_err_t box2_board_read_state(box2_board_state_t *state, bool sample_battery);

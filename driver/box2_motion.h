@@ -3,7 +3,8 @@
 #include <stdint.h>
 #include "driver/i2c_master.h"
 #include "esp_err.h"
-typedef struct {
+typedef struct
+{
     bool detected;
     uint8_t who_am_i;
     int16_t raw_x;
