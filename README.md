@@ -65,15 +65,13 @@ TF 卡应在上电前插入，并使用 FAT/FAT32/exFAT 文件系统；测试不
 
 ### 1. 准备 ESP-IDF 环境
 
-打开 PowerShell，进入工程并加载 ESP-IDF 6.0.2 环境：
+打开已配置好 ESP-IDF 6.0.2 环境的 PowerShell，进入项目根目录，然后执行：
 
 ```powershell
-cd C:\Users\ML\Documents\esp32_box2
-. C:\Espressif\tools\Microsoft.v6.0.2.PowerShell_profile.ps1
 idf.py --version
 ```
 
-如果使用其他安装位置，应改为对应的 ESP-IDF 6.0.2 PowerShell 环境脚本。成功后，
+如果尚未配置环境，请先按照 ESP-IDF 安装说明启动对应版本的 PowerShell。成功后，
 `idf.py --version` 应显示 `ESP-IDF v6.0.2`。
 
 ### 2. 首次配置和编译
