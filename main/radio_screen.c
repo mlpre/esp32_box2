@@ -5,6 +5,7 @@
 #include <inttypes.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include "box2_lcd.h"
@@ -125,15 +126,21 @@ static esp_err_t initialize_screen(void)
     lv_init();
     lv_tick_set_cb(lvgl_tick_ms);
     size_t buffer_bytes = SCREEN_WIDTH * DRAW_BUFFER_LINES * sizeof(lv_color16_t);
-    void *draw_buffer = heap_caps_malloc(buffer_bytes,
-                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    ESP_RETURN_ON_FALSE(draw_buffer, ESP_ERR_NO_MEM, TAG,
-                        "allocate LVGL draw buffer");
+    void *draw_buffer_a = heap_caps_malloc(
+        buffer_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    void *draw_buffer_b = heap_caps_malloc(
+        buffer_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (!draw_buffer_a || !draw_buffer_b)
+    {
+        free(draw_buffer_a);
+        free(draw_buffer_b);
+        return ESP_ERR_NO_MEM;
+    }
 
     s_display = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
     ESP_RETURN_ON_FALSE(s_display, ESP_ERR_NO_MEM, TAG, "create LVGL display");
     lv_display_set_color_format(s_display, LV_COLOR_FORMAT_RGB565);
-    lv_display_set_buffers(s_display, draw_buffer, NULL, buffer_bytes,
+    lv_display_set_buffers(s_display, draw_buffer_a, draw_buffer_b, buffer_bytes,
                            LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(s_display, lcd_flush);
 
@@ -319,5 +326,13 @@ esp_err_t radio_screen_show(const radio_screen_data_t *data)
     set_label_text_if_changed(s_top_battery, line);
 
     lv_timer_handler();
+    return ESP_OK;
+}
+
+esp_err_t radio_screen_force_redraw(void)
+{
+    ESP_RETURN_ON_ERROR(initialize_screen(), TAG, "initialize screen for redraw");
+    lv_obj_invalidate(lv_screen_active());
+    lv_refr_now(s_display);
     return ESP_OK;
 }

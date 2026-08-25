@@ -28,11 +28,81 @@
 #define KEY_LONG_PRESS_MS 2000
 #define WAKE_PIN_STABLE_MS 150
 #define BATTERY_REFRESH_MS 10000
+#define SCREEN_IDLE_TIMEOUT_MS 30000
+#define MOTION_THRESHOLD_MG 20
+#define MOTION_FAST_FILTER_SHIFT 2
+#define MOTION_BASELINE_FILTER_SHIFT 6
+#define SCREEN_BRIGHTNESS_PERCENT 100
 #define VOLUME_STEP 5
 
 static const char *TAG = "box2_radio";
 static EventGroupHandle_t s_wifi_events;
 static char s_ip_address[16] = "-";
+
+typedef struct
+{
+    bool initialized;
+    int32_t fast_x_q8;
+    int32_t fast_y_q8;
+    int32_t fast_z_q8;
+    int32_t baseline_x_q8;
+    int32_t baseline_y_q8;
+    int32_t baseline_z_q8;
+} motion_filter_t;
+
+static int32_t abs_i32(int32_t value)
+{
+    return value < 0 ? -value : value;
+}
+
+static bool motion_filter_update(motion_filter_t *filter,
+                                 const box2_motion_state_t *sample)
+{
+    int32_t x_q8 = (int32_t)sample->x_mg << 8;
+    int32_t y_q8 = (int32_t)sample->y_mg << 8;
+    int32_t z_q8 = (int32_t)sample->z_mg << 8;
+    if (!filter->initialized)
+    {
+        filter->initialized = true;
+        filter->fast_x_q8 = x_q8;
+        filter->fast_y_q8 = y_q8;
+        filter->fast_z_q8 = z_q8;
+        filter->baseline_x_q8 = x_q8;
+        filter->baseline_y_q8 = y_q8;
+        filter->baseline_z_q8 = z_q8;
+        return false;
+    }
+
+    /* The fast low-pass follows hand movement, while the slow baseline tracks
+       the resting orientation. Comparing those two rejects the speaker's
+       high-frequency vibration without losing gentle pick-up/tilt gestures. */
+    filter->fast_x_q8 +=
+        (x_q8 - filter->fast_x_q8) >> MOTION_FAST_FILTER_SHIFT;
+    filter->fast_y_q8 +=
+        (y_q8 - filter->fast_y_q8) >> MOTION_FAST_FILTER_SHIFT;
+    filter->fast_z_q8 +=
+        (z_q8 - filter->fast_z_q8) >> MOTION_FAST_FILTER_SHIFT;
+    filter->baseline_x_q8 +=
+        (filter->fast_x_q8 - filter->baseline_x_q8) >>
+        MOTION_BASELINE_FILTER_SHIFT;
+    filter->baseline_y_q8 +=
+        (filter->fast_y_q8 - filter->baseline_y_q8) >>
+        MOTION_BASELINE_FILTER_SHIFT;
+    filter->baseline_z_q8 +=
+        (filter->fast_z_q8 - filter->baseline_z_q8) >>
+        MOTION_BASELINE_FILTER_SHIFT;
+
+    int32_t delta_x =
+        abs_i32(filter->fast_x_q8 - filter->baseline_x_q8) >> 8;
+    int32_t delta_y =
+        abs_i32(filter->fast_y_q8 - filter->baseline_y_q8) >> 8;
+    int32_t delta_z =
+        abs_i32(filter->fast_z_q8 - filter->baseline_z_q8) >> 8;
+
+    return delta_x >= MOTION_THRESHOLD_MG ||
+           delta_y >= MOTION_THRESHOLD_MG ||
+           delta_z >= MOTION_THRESHOLD_MG;
+}
 
 static esp_err_t storage_init(void)
 {
@@ -242,8 +312,14 @@ void app_main(void)
     ESP_LOGI(TAG, "Starting standalone BOX2 Internet Radio, wake causes=0x%08lx",
              (unsigned long)esp_sleep_get_wakeup_causes());
     ESP_ERROR_CHECK(box2_board_init());
+    bool motion_available =
+        box2_motion_init(box2_board_i2c_bus()) == ESP_OK;
+    if (!motion_available)
+    {
+        ESP_LOGW(TAG, "Motion sensor unavailable; keeping screen on");
+    }
     ESP_ERROR_CHECK(box2_lcd_init());
-    ESP_ERROR_CHECK(box2_lcd_set_backlight(100));
+    ESP_ERROR_CHECK(box2_lcd_set_backlight(SCREEN_BRIGHTNESS_PERCENT));
     ESP_ERROR_CHECK(box2_audio_init(box2_board_i2c_bus()));
     ESP_ERROR_CHECK(storage_init());
     ESP_ERROR_CHECK_WITHOUT_ABORT(weather_service_init());
@@ -266,10 +342,56 @@ void app_main(void)
     bool weather_started = false;
     TickType_t last_ui = 0;
     TickType_t last_battery = xTaskGetTickCount();
+    TickType_t last_motion = last_battery;
+    motion_filter_t motion_filter = {0};
+    bool screen_on = true;
 
     while (true)
     {
         TickType_t now = xTaskGetTickCount();
+        if (motion_available)
+        {
+            box2_motion_state_t motion = {0};
+            esp_err_t motion_err = box2_motion_read(&motion);
+            if (motion_err == ESP_OK)
+            {
+                if (motion_filter_update(&motion_filter, &motion))
+                {
+                    last_motion = now;
+                    if (!screen_on)
+                    {
+                        ESP_LOGI(TAG, "Movement detected; waking screen");
+                        ESP_ERROR_CHECK_WITHOUT_ABORT(
+                            radio_screen_force_redraw());
+                        ESP_ERROR_CHECK_WITHOUT_ABORT(
+                            box2_lcd_set_backlight(SCREEN_BRIGHTNESS_PERCENT));
+                        screen_on = true;
+                    }
+                }
+                else if (screen_on &&
+                         (now - last_motion) >=
+                             pdMS_TO_TICKS(SCREEN_IDLE_TIMEOUT_MS))
+                {
+                    ESP_LOGI(TAG, "No movement for 30 seconds; screen off");
+                    ESP_ERROR_CHECK_WITHOUT_ABORT(box2_lcd_set_backlight(0));
+                    screen_on = false;
+                }
+            }
+            else
+            {
+                ESP_LOGW(TAG, "Motion read failed (%s); disabling screen timeout",
+                         esp_err_to_name(motion_err));
+                motion_available = false;
+                if (!screen_on)
+                {
+                    ESP_ERROR_CHECK_WITHOUT_ABORT(
+                        radio_screen_force_redraw());
+                    ESP_ERROR_CHECK_WITHOUT_ABORT(
+                        box2_lcd_set_backlight(SCREEN_BRIGHTNESS_PERCENT));
+                    screen_on = true;
+                }
+            }
+        }
         bool refresh_battery = (now - last_battery) >= pdMS_TO_TICKS(BATTERY_REFRESH_MS);
         if (box2_board_read_state(&board, refresh_battery) == ESP_OK && refresh_battery)
         {

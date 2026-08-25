@@ -18,3 +18,4 @@ typedef struct
 } radio_screen_data_t;
 
 esp_err_t radio_screen_show(const radio_screen_data_t *data);
+esp_err_t radio_screen_force_redraw(void);
