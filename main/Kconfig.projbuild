@@ -1,0 +1,15 @@
+menu "BOX2 Internet Radio"
+
+    config BOX2_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+        help
+            SSID used by the standalone Internet radio.
+
+    config BOX2_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default ""
+        help
+            Password for the configured Wi-Fi network. Leave empty for an open network.
+
+endmenu

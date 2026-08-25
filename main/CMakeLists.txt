@@ -1,14 +1,20 @@
 idf_component_register(
     SRCS
         "main.c"
-        "hardware_test_screen.c"
-        "hardware_test_utils.c"
+        "radio_font.c"
+        "radio_screen.c"
+        "radio_stream.c"
     INCLUDE_DIRS "."
+    EMBED_FILES
+        "radio_font.bin"
     PRIV_REQUIRES
         driver
+        esp_audio_codec
         esp_event
+        esp_http_client
         esp_netif
+        mbedtls
         esp_wifi
+        lvgl
         nvs_flash
-        spi_flash
 )

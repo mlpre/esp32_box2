@@ -4,7 +4,6 @@ idf_component_register(
         "box2_board.c"
         "box2_lcd.c"
         "box2_motion.c"
-        "box2_storage.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_adc
@@ -13,9 +12,6 @@ idf_component_register(
         esp_driver_i2c
         esp_driver_i2s
         esp_driver_ledc
-        esp_driver_sdspi
         esp_driver_spi
-        fatfs
         esp_lcd
-        sdmmc
 )
