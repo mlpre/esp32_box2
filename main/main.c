@@ -25,6 +25,7 @@
 #define WIFI_CONNECTED_BIT BIT0
 #define UI_REFRESH_MS 300
 #define KEY_POLL_MS 30
+#define KEY_DEBOUNCE_MS 60
 #define KEY_LONG_PRESS_MS 2000
 #define WAKE_PIN_STABLE_MS 150
 #define BATTERY_REFRESH_MS 10000
@@ -251,6 +252,18 @@ static void power_off_after_key_release(void)
 static void handle_keys(const box2_board_state_t *board, radio_status_t *radio,
                         TickType_t now)
 {
+    typedef struct
+    {
+        bool initialized;
+        bool stable;
+        bool candidate;
+        TickType_t candidate_since;
+    } key_debounce_t;
+
+    static key_debounce_t left_filter;
+    static key_debounce_t q_filter;
+    static key_debounce_t middle_filter;
+    static key_debounce_t right_filter;
     /* Physical order from left to right: q, left, middle, right. */
     static bool previous_left;
     static bool previous_q;
@@ -261,50 +274,85 @@ static void handle_keys(const box2_board_state_t *board, radio_status_t *radio,
     static TickType_t q_press_started;
     static TickType_t middle_press_started;
 
-    if (board->left_pressed && !previous_left)
+#define DEBOUNCE_KEY(filter, raw_value)                                      \
+    do                                                                       \
+    {                                                                        \
+        if (!(filter).initialized)                                           \
+        {                                                                    \
+            (filter).initialized = true;                                     \
+            (filter).stable = (raw_value);                                   \
+            (filter).candidate = (raw_value);                                \
+            (filter).candidate_since = now;                                  \
+        }                                                                    \
+        else if ((filter).candidate != (raw_value))                          \
+        {                                                                    \
+            (filter).candidate = (raw_value);                                \
+            (filter).candidate_since = now;                                  \
+        }                                                                    \
+        else if ((filter).stable != (filter).candidate &&                    \
+                 (now - (filter).candidate_since) >=                         \
+                     pdMS_TO_TICKS(KEY_DEBOUNCE_MS))                         \
+        {                                                                    \
+            (filter).stable = (filter).candidate;                            \
+        }                                                                    \
+    } while (0)
+
+    DEBOUNCE_KEY(left_filter, board->left_pressed);
+    DEBOUNCE_KEY(q_filter, board->q_pressed);
+    DEBOUNCE_KEY(middle_filter, board->middle_pressed);
+    DEBOUNCE_KEY(right_filter, board->right_pressed);
+
+    bool left_pressed = left_filter.stable;
+    bool q_pressed = q_filter.stable;
+    bool middle_pressed = middle_filter.stable;
+    bool right_pressed = right_filter.stable;
+
+    if (left_pressed && !previous_left)
     {
         radio_stream_set_volume(radio->volume_percent - VOLUME_STEP);
     }
-    if (board->right_pressed && !previous_right)
+    if (right_pressed && !previous_right)
     {
         radio_stream_next();
     }
-    if (board->q_pressed && !previous_q)
+    if (q_pressed && !previous_q)
     {
         q_press_started = now;
         q_long_press_triggered = false;
     }
-    if (board->q_pressed && !q_long_press_triggered &&
+    if (q_pressed && !q_long_press_triggered &&
         (now - q_press_started) >= pdMS_TO_TICKS(KEY_LONG_PRESS_MS))
     {
         radio_stream_request_directory_update();
         q_long_press_triggered = true;
     }
-    if (!board->q_pressed && previous_q && !q_long_press_triggered)
+    if (!q_pressed && previous_q && !q_long_press_triggered)
     {
         radio_stream_previous();
     }
-    if (board->middle_pressed && !previous_middle)
+    if (middle_pressed && !previous_middle)
     {
         middle_press_started = now;
         middle_long_press_triggered = false;
     }
-    if (board->middle_pressed && !middle_long_press_triggered &&
+    if (middle_pressed && !middle_long_press_triggered &&
         (now - middle_press_started) >= pdMS_TO_TICKS(KEY_LONG_PRESS_MS))
     {
         middle_long_press_triggered = true;
         power_off_after_key_release();
     }
-    if (!board->middle_pressed && previous_middle &&
+    if (!middle_pressed && previous_middle &&
         !middle_long_press_triggered)
     {
         radio_stream_set_volume(radio->volume_percent + VOLUME_STEP);
     }
 
-    previous_left = board->left_pressed;
-    previous_q = board->q_pressed;
-    previous_middle = board->middle_pressed;
-    previous_right = board->right_pressed;
+    previous_left = left_pressed;
+    previous_q = q_pressed;
+    previous_middle = middle_pressed;
+    previous_right = right_pressed;
+
+#undef DEBOUNCE_KEY
 }
 
 void app_main(void)

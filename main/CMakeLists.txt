@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "main.c"
+        "audio_resampler.c"
         "radio_font.c"
         "radio_screen.c"
         "radio_stream.c"

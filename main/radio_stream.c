@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "audio_resampler.h"
 #include "box2_audio.h"
 #include "esp_audio_dec_default.h"
 #include "esp_audio_simple_dec.h"
@@ -17,18 +18,25 @@
 #include "esp_log.h"
 #include "esp_partition.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/stream_buffer.h"
 #include "freertos/task.h"
 #include "nvs.h"
 
 #define RADIO_TASK_STACK_SIZE (32 * 1024)
+#define NETWORK_TASK_STACK_SIZE (10 * 1024)
+#define PLAYBACK_TASK_STACK_SIZE (8 * 1024)
 #define HTTP_READ_SIZE 4096
-#define HTTP_AUDIO_BUFFER_SIZE (16 * 1024)
-#define HTTP_AUDIO_PREBUFFER_SIZE (12 * 1024)
-#define PCM_BUFFER_INITIAL_SIZE 8192
-#define RESAMPLE_OUTPUT_SAMPLES 4096
+#define COMPRESSED_STREAM_BUFFER_SIZE (192 * 1024)
+#define COMPRESSED_PREBUFFER_SIZE (48 * 1024)
+#define COMPRESSED_DECODE_BUFFER_SIZE (32 * 1024)
+#define PCM_STREAM_BUFFER_SIZE (192 * 1024)
+#define PCM_PREBUFFER_SIZE (96 * 1024)
+#define PCM_PLAYBACK_CHUNK_SIZE 4096
+#define PCM_BUFFER_INITIAL_SIZE (16 * 1024)
 #define RADIO_RETRY_DELAY_MS 2500
 #define DIRECTORY_RETRY_DELAY_MS 5000
-#define RADIO_OUTPUT_RATE 24000
+#define RADIO_OUTPUT_RATE 48000
 #define DIRECTORY_MAX_STATIONS 1000
 #define DIRECTORY_MAX_BYTES (256 * 1024)
 #define DIRECTORY_CACHE_MAGIC 0x52414449UL
@@ -49,6 +57,31 @@ typedef struct
     char url[256];
 } radio_station_t;
 
+#define PIPELINE_NETWORK_READY BIT0
+#define PIPELINE_NETWORK_DONE BIT1
+#define PIPELINE_NETWORK_FAILED BIT2
+#define PIPELINE_DECODER_DONE BIT3
+#define PIPELINE_PLAYBACK_DONE BIT4
+#define PIPELINE_PLAYBACK_FAILED BIT5
+#define PIPELINE_STOP_REQUESTED BIT6
+
+typedef struct
+{
+    radio_station_t station;
+    uint32_t generation;
+    EventGroupHandle_t events;
+    StreamBufferHandle_t compressed_stream;
+    StreamBufferHandle_t pcm_stream;
+    StaticStreamBuffer_t *compressed_control;
+    StaticStreamBuffer_t *pcm_control;
+    uint8_t *compressed_storage;
+    uint8_t *pcm_storage;
+    esp_err_t network_result;
+    esp_err_t playback_result;
+    char network_error[64];
+    char playback_error[64];
+} radio_pipeline_t;
+
 typedef struct
 {
     uint32_t magic;
@@ -56,15 +89,6 @@ typedef struct
     uint32_t length;
     uint32_t checksum;
 } directory_cache_header_t;
-
-typedef struct
-{
-    uint32_t source_rate;
-    bool started;
-    int16_t previous;
-    uint64_t next_q32;
-    uint64_t step_q32;
-} linear_resampler_t;
 
 static const char *TAG = "radio_stream";
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -128,86 +152,75 @@ static bool selection_changed(uint32_t generation)
     return changed;
 }
 
-static esp_err_t write_output_samples(const int16_t *samples, size_t count)
+static bool pipeline_stopping(const radio_pipeline_t *pipeline)
 {
-    if (count == 0)
+    return (xEventGroupGetBits(pipeline->events) & PIPELINE_STOP_REQUESTED) != 0 ||
+           selection_changed(pipeline->generation);
+}
+
+static StreamBufferHandle_t create_psram_stream(size_t size,
+                                                uint8_t **storage,
+                                                StaticStreamBuffer_t **control)
+{
+    *storage = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    *control = heap_caps_malloc(sizeof(**control),
+                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!*storage || !*control)
+    {
+        free(*storage);
+        free(*control);
+        *storage = NULL;
+        *control = NULL;
+        return NULL;
+    }
+    StreamBufferHandle_t stream =
+        xStreamBufferCreateStatic(size, 1, *storage, *control);
+    if (!stream)
+    {
+        free(*storage);
+        free(*control);
+        *storage = NULL;
+        *control = NULL;
+    }
+    return stream;
+}
+
+static void delete_psram_stream(StreamBufferHandle_t stream, uint8_t *storage,
+                                StaticStreamBuffer_t *control)
+{
+    if (stream)
+    {
+        vStreamBufferDelete(stream);
+    }
+    free(storage);
+    free(control);
+}
+
+static esp_err_t queue_pcm_samples(const int16_t *samples, size_t sample_count,
+                                   void *context)
+{
+    radio_pipeline_t *pipeline = context;
+    if (pipeline_stopping(pipeline))
     {
         return ESP_OK;
     }
-    return box2_audio_write(samples, count);
-}
-
-static void resampler_reset(linear_resampler_t *resampler, uint32_t source_rate)
-{
-    memset(resampler, 0, sizeof(*resampler));
-    resampler->source_rate = source_rate;
-    resampler->step_q32 = ((uint64_t)source_rate << 32) / RADIO_OUTPUT_RATE;
-    if (resampler->step_q32 == 0)
+    const uint8_t *data = (const uint8_t *)samples;
+    size_t remaining = sample_count * sizeof(*samples);
+    while (remaining && !pipeline_stopping(pipeline))
     {
-        resampler->step_q32 = 1;
+        size_t sent = xStreamBufferSend(pipeline->pcm_stream, data, remaining,
+                                        pdMS_TO_TICKS(100));
+        data += sent;
+        remaining -= sent;
     }
-}
-
-static esp_err_t resample_and_write(linear_resampler_t *resampler,
-                                    const int16_t *pcm,
-                                    size_t frame_count,
-                                    uint8_t channels,
-                                    int16_t *output,
-                                    size_t output_capacity)
-{
-    const uint64_t one_q32 = 1ULL << 32;
-    size_t output_count = 0;
-
-    for (size_t i = 0; i < frame_count; ++i)
-    {
-        int16_t current;
-        if (channels == 1)
-        {
-            current = pcm[i];
-        }
-        else
-        {
-            int32_t mixed = (int32_t)pcm[i * channels] + pcm[i * channels + 1];
-            current = (int16_t)(mixed / 2);
-        }
-
-        if (!resampler->started)
-        {
-            resampler->started = true;
-            resampler->previous = current;
-            resampler->next_q32 = resampler->step_q32;
-            output[output_count++] = current;
-            continue;
-        }
-
-        while (resampler->next_q32 <= one_q32)
-        {
-            int32_t delta = (int32_t)current - resampler->previous;
-            int32_t interpolated = resampler->previous +
-                                   (int32_t)(((int64_t)delta *
-                                              (int64_t)resampler->next_q32) >> 32);
-            output[output_count++] = (int16_t)interpolated;
-            resampler->next_q32 += resampler->step_q32;
-            if (output_count == output_capacity)
-            {
-                ESP_RETURN_ON_ERROR(write_output_samples(output, output_count), TAG,
-                                    "write resampled audio");
-                output_count = 0;
-            }
-        }
-        resampler->next_q32 -= one_q32;
-        resampler->previous = current;
-    }
-
-    return write_output_samples(output, output_count);
+    return ESP_OK;
 }
 
 static esp_err_t render_decoded_frame(esp_audio_simple_dec_handle_t decoder,
                                       const uint8_t *pcm_data,
                                       size_t pcm_size,
-                                      linear_resampler_t *resampler,
-                                      int16_t *resample_output,
-                                      size_t resample_capacity)
+                                      audio_resampler_t *resampler,
+                                      radio_pipeline_t *pipeline)
 {
     esp_audio_simple_dec_info_t info = {0};
     if (esp_audio_simple_dec_get_info(decoder, &info) != ESP_AUDIO_ERR_OK)
@@ -221,17 +234,19 @@ static esp_err_t render_decoded_frame(esp_audio_simple_dec_handle_t decoder,
                  info.sample_rate, info.bits_per_sample, info.channel);
         return ESP_ERR_NOT_SUPPORTED;
     }
-    if (resampler->source_rate != info.sample_rate)
+    radio_status_t current_status = {0};
+    radio_stream_get_status(&current_status);
+    if (current_status.source_sample_rate != info.sample_rate)
     {
         ESP_LOGI(TAG, "MP3 format: %" PRIu32 " Hz, %u ch, %" PRIu32 " kbps",
                  info.sample_rate, info.channel, info.bitrate / 1000);
-        resampler_reset(resampler, info.sample_rate);
     }
     status_set_audio_info(&info);
 
     size_t frame_count = pcm_size / (sizeof(int16_t) * info.channel);
-    return resample_and_write(resampler, (const int16_t *)pcm_data, frame_count,
-                              info.channel, resample_output, resample_capacity);
+    return audio_resampler_process(resampler, (const int16_t *)pcm_data,
+                                   frame_count, info.channel, info.sample_rate,
+                                   queue_pcm_samples, pipeline);
 }
 
 static void make_display_name(const char *source, char *destination, size_t capacity)
@@ -658,38 +673,16 @@ cleanup:
     return result;
 }
 
-static esp_err_t play_station(size_t station_index, uint32_t generation)
+static void network_stream_task(void *argument)
 {
-    esp_err_t result = ESP_FAIL;
+    radio_pipeline_t *pipeline = argument;
     esp_http_client_handle_t client = NULL;
-    esp_audio_simple_dec_handle_t decoder = NULL;
-    uint8_t *http_buffer = NULL;
-    uint8_t *pcm_buffer = NULL;
-    int16_t *resample_output = NULL;
-    size_t pcm_capacity = PCM_BUFFER_INITIAL_SIZE;
-    linear_resampler_t resampler = {0};
-    char error_text[64] = {0};
-    radio_station_t station = {0};
-
-    portENTER_CRITICAL(&s_lock);
-    size_t station_count = s_status.station_count;
-    if (station_count)
-    {
-        station = s_active_stations[station_index % station_count];
-    }
-    portEXIT_CRITICAL(&s_lock);
-    if (station_count == 0 || station.url[0] == '\0')
-    {
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    status_set_state(RADIO_STATE_CONNECTING, NULL);
-    ESP_LOGI(TAG, "Opening station %u: %s", (unsigned)(station_index + 1),
-             station.name);
+    uint8_t *buffer = NULL;
+    esp_err_t result = ESP_FAIL;
 
     esp_http_client_config_t http_cfg = {
-        .url = station.url,
-        .user_agent = "BOX2-Internet-Radio/1.0",
+        .url = pipeline->station.url,
+        .user_agent = "BOX2-Internet-Radio/1.2",
         .timeout_ms = 5000,
         .buffer_size = HTTP_READ_SIZE,
         .buffer_size_tx = 1024,
@@ -699,9 +692,12 @@ static esp_err_t play_station(size_t station_index, uint32_t generation)
         .keep_alive_enable = true,
     };
     client = esp_http_client_init(&http_cfg);
-    if (!client)
+    buffer = heap_caps_malloc(HTTP_READ_SIZE,
+                              MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!client || !buffer)
     {
-        snprintf(error_text, sizeof(error_text), "网络模块启动失败");
+        snprintf(pipeline->network_error, sizeof(pipeline->network_error),
+                 "网络缓冲内存不足");
         result = ESP_ERR_NO_MEM;
         goto cleanup;
     }
@@ -710,22 +706,162 @@ static esp_err_t play_station(size_t station_index, uint32_t generation)
     result = esp_http_client_open(client, 0);
     if (result != ESP_OK)
     {
-        snprintf(error_text, sizeof(error_text), "连接失败 %s", esp_err_to_name(result));
+        snprintf(pipeline->network_error, sizeof(pipeline->network_error),
+                 "连接失败 %s", esp_err_to_name(result));
         goto cleanup;
     }
     if (esp_http_client_fetch_headers(client) < 0)
     {
-        snprintf(error_text, sizeof(error_text), "网络响应无效");
+        snprintf(pipeline->network_error, sizeof(pipeline->network_error),
+                 "网络响应无效");
         result = ESP_FAIL;
         goto cleanup;
     }
     int status_code = esp_http_client_get_status_code(client);
     if (status_code != 200)
     {
-        snprintf(error_text, sizeof(error_text), "网络状态码 %d", status_code);
+        snprintf(pipeline->network_error, sizeof(pipeline->network_error),
+                 "网络状态码 %d", status_code);
         result = ESP_FAIL;
         goto cleanup;
     }
+
+    xEventGroupSetBits(pipeline->events, PIPELINE_NETWORK_READY);
+    if (!selection_changed(pipeline->generation))
+    {
+        status_set_state(RADIO_STATE_BUFFERING, NULL);
+    }
+    while (!pipeline_stopping(pipeline))
+    {
+        int read_size = esp_http_client_read(client, (char *)buffer, HTTP_READ_SIZE);
+        if (read_size <= 0)
+        {
+            snprintf(pipeline->network_error, sizeof(pipeline->network_error),
+                     "电台流已中断 %d", read_size);
+            result = ESP_FAIL;
+            break;
+        }
+        status_add_received((size_t)read_size);
+        size_t sent = 0;
+        while (sent < (size_t)read_size && !pipeline_stopping(pipeline))
+        {
+            sent += xStreamBufferSend(pipeline->compressed_stream, buffer + sent,
+                                      (size_t)read_size - sent,
+                                      pdMS_TO_TICKS(100));
+        }
+    }
+    if (pipeline_stopping(pipeline))
+    {
+        result = ESP_OK;
+        pipeline->network_error[0] = '\0';
+    }
+
+cleanup:
+    if (client)
+    {
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+    }
+    free(buffer);
+    pipeline->network_result = result;
+    EventBits_t bits = PIPELINE_NETWORK_DONE;
+    if (result != ESP_OK)
+    {
+        bits |= PIPELINE_NETWORK_FAILED;
+    }
+    xEventGroupSetBits(pipeline->events, bits);
+    vTaskDelete(NULL);
+}
+
+static void audio_playback_task(void *argument)
+{
+    radio_pipeline_t *pipeline = argument;
+    uint8_t *buffer = heap_caps_malloc(PCM_PLAYBACK_CHUNK_SIZE,
+                                       MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    esp_err_t result = buffer ? ESP_OK : ESP_ERR_NO_MEM;
+    bool started = false;
+    unsigned underflows = 0;
+    if (!buffer)
+    {
+        snprintf(pipeline->playback_error, sizeof(pipeline->playback_error),
+                 "播放缓冲内存不足");
+        goto cleanup;
+    }
+
+    while (!pipeline_stopping(pipeline))
+    {
+        EventBits_t bits = xEventGroupGetBits(pipeline->events);
+        size_t available = xStreamBufferBytesAvailable(pipeline->pcm_stream);
+        if (!started && available < PCM_PREBUFFER_SIZE &&
+            !(bits & PIPELINE_DECODER_DONE))
+        {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        if (available == 0 && (bits & PIPELINE_DECODER_DONE))
+        {
+            break;
+        }
+
+        size_t received = xStreamBufferReceive(
+            pipeline->pcm_stream, buffer, PCM_PLAYBACK_CHUNK_SIZE,
+            pdMS_TO_TICKS(200));
+        if (received == 0)
+        {
+            if (started && !(xEventGroupGetBits(pipeline->events) &
+                             PIPELINE_DECODER_DONE))
+            {
+                ++underflows;
+                ESP_LOGW(TAG, "PCM buffer underflow %u", underflows);
+            }
+            continue;
+        }
+        if ((received & 1U) != 0)
+        {
+            snprintf(pipeline->playback_error, sizeof(pipeline->playback_error),
+                     "播放数据未对齐");
+            result = ESP_ERR_INVALID_SIZE;
+            break;
+        }
+        result = box2_audio_write((const int16_t *)buffer,
+                                  received / sizeof(int16_t));
+        if (result != ESP_OK)
+        {
+            snprintf(pipeline->playback_error, sizeof(pipeline->playback_error),
+                     "I2S输出失败 %s", esp_err_to_name(result));
+            break;
+        }
+        if (!started)
+        {
+            started = true;
+            status_set_state(RADIO_STATE_PLAYING, NULL);
+            ESP_LOGI(TAG, "48 kHz playback started with %u buffered PCM bytes",
+                     (unsigned)available);
+        }
+    }
+
+cleanup:
+    free(buffer);
+    pipeline->playback_result = result;
+    EventBits_t bits = PIPELINE_PLAYBACK_DONE;
+    if (result != ESP_OK)
+    {
+        bits |= PIPELINE_PLAYBACK_FAILED;
+    }
+    xEventGroupSetBits(pipeline->events, bits);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t decode_pipeline(radio_pipeline_t *pipeline, char *error_text,
+                                 size_t error_capacity)
+{
+    esp_err_t result = ESP_FAIL;
+    esp_audio_simple_dec_handle_t decoder = NULL;
+    audio_resampler_t *resampler = NULL;
+    uint8_t *compressed = NULL;
+    uint8_t *pcm_buffer = NULL;
+    size_t pcm_capacity = PCM_BUFFER_INITIAL_SIZE;
+    size_t buffered = 0;
 
     esp_audio_simple_dec_cfg_t decoder_cfg = {
         .dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_MP3,
@@ -735,79 +871,87 @@ static esp_err_t play_station(size_t station_index, uint32_t generation)
     };
     if (esp_audio_simple_dec_open(&decoder_cfg, &decoder) != ESP_AUDIO_ERR_OK)
     {
-        snprintf(error_text, sizeof(error_text), "MP3解码器启动失败");
+        snprintf(error_text, error_capacity, "MP3解码器启动失败");
         result = ESP_FAIL;
         goto cleanup;
     }
-
-    http_buffer = heap_caps_malloc(HTTP_AUDIO_BUFFER_SIZE,
-                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    pcm_buffer = malloc(pcm_capacity);
-    resample_output = malloc(RESAMPLE_OUTPUT_SAMPLES * sizeof(int16_t));
-    if (!http_buffer || !pcm_buffer || !resample_output)
+    resampler = audio_resampler_create(RADIO_OUTPUT_RATE);
+    compressed = heap_caps_malloc(COMPRESSED_DECODE_BUFFER_SIZE,
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    pcm_buffer = heap_caps_malloc(pcm_capacity,
+                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!resampler || !compressed || !pcm_buffer)
     {
-        snprintf(error_text, sizeof(error_text), "音频内存不足");
+        snprintf(error_text, error_capacity, "解码缓冲内存不足");
         result = ESP_ERR_NO_MEM;
         goto cleanup;
     }
 
-    status_set_state(RADIO_STATE_BUFFERING, NULL);
-    size_t buffered = 0;
-    while (buffered < HTTP_AUDIO_PREBUFFER_SIZE &&
-           !selection_changed(generation))
+    while (!pipeline_stopping(pipeline))
     {
-        int read_size = esp_http_client_read(
-            client, (char *)http_buffer + buffered,
-            HTTP_AUDIO_BUFFER_SIZE - buffered);
-        if (read_size <= 0)
+        EventBits_t bits = xEventGroupGetBits(pipeline->events);
+        if (xStreamBufferBytesAvailable(pipeline->compressed_stream) >=
+                COMPRESSED_PREBUFFER_SIZE ||
+            (bits & PIPELINE_NETWORK_DONE))
         {
-            snprintf(error_text, sizeof(error_text),
-                     "电台预缓冲失败 %d", read_size);
-            result = ESP_FAIL;
-            goto cleanup;
+            break;
         }
-        buffered += (size_t)read_size;
-        status_add_received((size_t)read_size);
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 
-    bool first_audio_frame = true;
-    while (!selection_changed(generation))
+    while (!pipeline_stopping(pipeline))
     {
-        if (buffered < HTTP_AUDIO_PREBUFFER_SIZE)
+        size_t capacity = COMPRESSED_DECODE_BUFFER_SIZE - buffered;
+        if (capacity)
         {
-            int read_size = esp_http_client_read(
-                client, (char *)http_buffer + buffered,
-                HTTP_AUDIO_BUFFER_SIZE - buffered);
-            if (read_size <= 0)
+            buffered += xStreamBufferReceive(
+                pipeline->compressed_stream, compressed + buffered, capacity,
+                pdMS_TO_TICKS(100));
+        }
+
+        EventBits_t bits = xEventGroupGetBits(pipeline->events);
+        if (buffered == 0)
+        {
+            if (bits & PIPELINE_NETWORK_DONE)
             {
-                snprintf(error_text, sizeof(error_text),
-                         "电台流已中断 %d", read_size);
-                result = ESP_FAIL;
+                result = pipeline->network_result == ESP_OK
+                             ? ESP_FAIL
+                             : pipeline->network_result;
+                if (pipeline->network_error[0])
+                {
+                    strlcpy(error_text, pipeline->network_error, error_capacity);
+                }
+                else
+                {
+                    snprintf(error_text, error_capacity, "电台流已结束");
+                }
                 break;
             }
-            buffered += (size_t)read_size;
-            status_add_received((size_t)read_size);
+            continue;
         }
 
         esp_audio_simple_dec_raw_t raw = {
-            .buffer = http_buffer,
+            .buffer = compressed,
             .len = (uint32_t)buffered,
             .eos = false,
         };
-        while (raw.len && !selection_changed(generation))
+        while (raw.len && !pipeline_stopping(pipeline))
         {
             esp_audio_simple_dec_out_t decoded = {
                 .buffer = pcm_buffer,
                 .len = (uint32_t)pcm_capacity,
             };
             raw.consumed = 0;
-            esp_audio_err_t decode_err = esp_audio_simple_dec_process(decoder, &raw, &decoded);
+            esp_audio_err_t decode_err =
+                esp_audio_simple_dec_process(decoder, &raw, &decoded);
             if (decode_err == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH)
             {
-                uint8_t *larger = realloc(pcm_buffer, decoded.needed_size);
+                uint8_t *larger = heap_caps_realloc(
+                    pcm_buffer, decoded.needed_size,
+                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
                 if (!larger)
                 {
-                    snprintf(error_text, sizeof(error_text), "解码内存不足");
+                    snprintf(error_text, error_capacity, "解码内存不足");
                     result = ESP_ERR_NO_MEM;
                     goto cleanup;
                 }
@@ -817,30 +961,32 @@ static esp_err_t play_station(size_t station_index, uint32_t generation)
             }
             if (decode_err != ESP_AUDIO_ERR_OK)
             {
-                snprintf(error_text, sizeof(error_text), "MP3解码错误 %d", decode_err);
+                snprintf(error_text, error_capacity, "MP3解码错误 %d", decode_err);
                 result = ESP_FAIL;
                 goto cleanup;
             }
             if (decoded.decoded_size)
             {
-                result = render_decoded_frame(decoder, decoded.buffer, decoded.decoded_size,
-                                              &resampler, resample_output,
-                                              RESAMPLE_OUTPUT_SAMPLES);
+                result = render_decoded_frame(decoder, decoded.buffer,
+                                              decoded.decoded_size, resampler,
+                                              pipeline);
                 if (result != ESP_OK)
                 {
-                    snprintf(error_text, sizeof(error_text), "音频输出失败 %s",
-                             esp_err_to_name(result));
+                    if (pipeline_stopping(pipeline))
+                    {
+                        result = ESP_OK;
+                    }
+                    else
+                    {
+                        snprintf(error_text, error_capacity, "音频缓冲失败 %s",
+                                 esp_err_to_name(result));
+                    }
                     goto cleanup;
-                }
-                if (first_audio_frame)
-                {
-                    first_audio_frame = false;
-                    status_set_state(RADIO_STATE_PLAYING, NULL);
                 }
             }
             if (raw.consumed > raw.len)
             {
-                snprintf(error_text, sizeof(error_text), "解码数据异常");
+                snprintf(error_text, error_capacity, "解码数据异常");
                 result = ESP_FAIL;
                 goto cleanup;
             }
@@ -853,20 +999,21 @@ static esp_err_t play_station(size_t station_index, uint32_t generation)
         }
 
         size_t remaining = raw.len;
-        if (remaining == buffered)
+        if (remaining == buffered && buffered == COMPRESSED_DECODE_BUFFER_SIZE)
         {
-            if (buffered == HTTP_AUDIO_BUFFER_SIZE)
-            {
-                snprintf(error_text, sizeof(error_text), "MP3帧超过缓冲区");
-                result = ESP_ERR_INVALID_SIZE;
-                goto cleanup;
-            }
+            snprintf(error_text, error_capacity, "MP3帧超过解码缓冲区");
+            result = ESP_ERR_INVALID_SIZE;
+            break;
         }
-        else if (remaining)
+        if (remaining && raw.buffer != compressed)
         {
-            memmove(http_buffer, raw.buffer, remaining);
+            memmove(compressed, raw.buffer, remaining);
         }
         buffered = remaining;
+    }
+    if (pipeline_stopping(pipeline))
+    {
+        result = ESP_OK;
     }
 
 cleanup:
@@ -874,20 +1021,101 @@ cleanup:
     {
         esp_audio_simple_dec_close(decoder);
     }
-    if (client)
-    {
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-    }
-    free(http_buffer);
+    audio_resampler_destroy(resampler);
+    free(compressed);
     free(pcm_buffer);
-    free(resample_output);
+    return result;
+}
 
-    if (!selection_changed(generation))
+static esp_err_t play_station(size_t station_index, uint32_t generation)
+{
+    esp_err_t result = ESP_FAIL;
+    char error_text[64] = {0};
+    radio_pipeline_t pipeline = {
+        .generation = generation,
+        .network_result = ESP_FAIL,
+        .playback_result = ESP_OK,
+    };
+
+    portENTER_CRITICAL(&s_lock);
+    size_t station_count = s_status.station_count;
+    if (station_count)
     {
-        status_set_state(RADIO_STATE_RETRYING,
-                         error_text[0] ? error_text : esp_err_to_name(result));
-        ESP_LOGW(TAG, "%s; retrying", error_text[0] ? error_text : esp_err_to_name(result));
+        pipeline.station = s_active_stations[station_index % station_count];
+    }
+    portEXIT_CRITICAL(&s_lock);
+    if (station_count == 0 || pipeline.station.url[0] == '\0')
+    {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    status_set_state(RADIO_STATE_CONNECTING, NULL);
+    ESP_LOGI(TAG, "Opening station %u: %s", (unsigned)(station_index + 1),
+             pipeline.station.name);
+
+    pipeline.events = xEventGroupCreate();
+    pipeline.compressed_stream = create_psram_stream(
+        COMPRESSED_STREAM_BUFFER_SIZE, &pipeline.compressed_storage,
+        &pipeline.compressed_control);
+    pipeline.pcm_stream = create_psram_stream(
+        PCM_STREAM_BUFFER_SIZE, &pipeline.pcm_storage, &pipeline.pcm_control);
+    if (!pipeline.events || !pipeline.compressed_stream || !pipeline.pcm_stream)
+    {
+        snprintf(error_text, sizeof(error_text), "音频流水线内存不足");
+        result = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
+    BaseType_t playback_created = xTaskCreatePinnedToCore(
+        audio_playback_task, "radio_playback", PLAYBACK_TASK_STACK_SIZE,
+        &pipeline, 8, NULL, 1);
+    if (playback_created != pdPASS)
+    {
+        snprintf(error_text, sizeof(error_text), "播放任务启动失败");
+        result = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+    BaseType_t network_created = xTaskCreatePinnedToCore(
+        network_stream_task, "radio_network", NETWORK_TASK_STACK_SIZE,
+        &pipeline, 5, NULL, 0);
+    if (network_created != pdPASS)
+    {
+        snprintf(error_text, sizeof(error_text), "网络任务启动失败");
+        result = ESP_ERR_NO_MEM;
+        xEventGroupSetBits(pipeline.events,
+                           PIPELINE_STOP_REQUESTED | PIPELINE_DECODER_DONE);
+        xEventGroupWaitBits(pipeline.events, PIPELINE_PLAYBACK_DONE, pdFALSE,
+                            pdTRUE, portMAX_DELAY);
+        goto cleanup;
+    }
+
+    result = decode_pipeline(&pipeline, error_text, sizeof(error_text));
+    xEventGroupSetBits(pipeline.events,
+                       PIPELINE_STOP_REQUESTED | PIPELINE_DECODER_DONE);
+    xEventGroupWaitBits(pipeline.events,
+                        PIPELINE_NETWORK_DONE | PIPELINE_PLAYBACK_DONE,
+                        pdFALSE, pdTRUE, portMAX_DELAY);
+    if (result == ESP_OK && pipeline.playback_result != ESP_OK)
+    {
+        result = pipeline.playback_result;
+        strlcpy(error_text, pipeline.playback_error, sizeof(error_text));
+    }
+
+cleanup:
+    delete_psram_stream(pipeline.compressed_stream,
+                        pipeline.compressed_storage,
+                        pipeline.compressed_control);
+    delete_psram_stream(pipeline.pcm_stream, pipeline.pcm_storage,
+                        pipeline.pcm_control);
+    if (pipeline.events)
+    {
+        vEventGroupDelete(pipeline.events);
+    }
+    if (!selection_changed(generation) && result != ESP_OK)
+    {
+        const char *message = error_text[0] ? error_text : esp_err_to_name(result);
+        status_set_state(RADIO_STATE_RETRYING, message);
+        ESP_LOGW(TAG, "%s; retrying", message);
     }
     return result;
 }
@@ -977,8 +1205,9 @@ esp_err_t radio_stream_start(void)
     {
         return ESP_OK;
     }
-    BaseType_t created = xTaskCreate(radio_task, "radio_stream", RADIO_TASK_STACK_SIZE,
-                                     NULL, 6, &s_task);
+    BaseType_t created = xTaskCreatePinnedToCore(
+        radio_task, "radio_stream", RADIO_TASK_STACK_SIZE,
+        NULL, 6, &s_task, 1);
     return created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 

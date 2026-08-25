@@ -1,6 +1,6 @@
 #pragma once
 #include "driver/gpio.h"
-#define BOX2_AUDIO_SAMPLE_RATE 24000
+#define BOX2_AUDIO_SAMPLE_RATE 48000
 #define BOX2_I2S_MCLK GPIO_NUM_38
 #define BOX2_I2S_WS GPIO_NUM_42
 #define BOX2_I2S_BCLK GPIO_NUM_40
