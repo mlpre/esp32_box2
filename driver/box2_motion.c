@@ -7,6 +7,7 @@
 #define SC7A20_REG_CTRL1 0x20
 #define SC7A20_REG_CTRL2 0x21
 #define SC7A20_REG_CTRL3 0x22
+#define SC7A20_REG_CTRL4 0x23
 #define SC7A20_REG_OUT_X_L 0x28
 #define SC7A20_REG_MISC 0x57
 #define SC7A20_WHO_AM_I 0x11
@@ -62,6 +63,8 @@ esp_err_t box2_motion_init(i2c_master_bus_handle_t i2c_bus)
     ESP_RETURN_ON_ERROR(write_reg(SC7A20_REG_CTRL1, 0x47), TAG, "configure CTRL1");
     ESP_RETURN_ON_ERROR(write_reg(SC7A20_REG_CTRL2, 0x07), TAG, "configure CTRL2");
     ESP_RETURN_ON_ERROR(write_reg(SC7A20_REG_CTRL3, 0x00), TAG, "configure CTRL3");
+    ESP_RETURN_ON_ERROR(write_reg(SC7A20_REG_CTRL4, 0x88), TAG,
+                        "configure high-resolution block update");
     ESP_RETURN_ON_ERROR(write_reg(SC7A20_REG_MISC, 0x08), TAG, "configure sensor");
     ESP_LOGI(TAG, "SC7A20 PASS: address=0x%02X ID=0x%02X", BOX2_SC7A20_ADDR,
              s_who_am_i);
@@ -72,11 +75,10 @@ esp_err_t box2_motion_read(box2_motion_state_t *state)
     ESP_RETURN_ON_FALSE(state && s_sensor, ESP_ERR_INVALID_STATE, TAG,
                         "SC7A20 is not initialized");
     uint8_t data[6];
-    for (int i = 0; i < 6; ++i)
-    {
-        ESP_RETURN_ON_ERROR(read_reg(SC7A20_REG_OUT_X_L + i, &data[i]), TAG,
-                            "read acceleration");
-    }
+    uint8_t first_reg = SC7A20_REG_OUT_X_L | 0x80;
+    ESP_RETURN_ON_ERROR(i2c_master_transmit_receive(s_sensor, &first_reg, 1, data,
+                                                    sizeof(data), 100),
+                        TAG, "read coherent acceleration sample");
     state->detected = true;
     state->who_am_i = s_who_am_i;
     state->raw_x = (int16_t)((uint16_t)data[0] | ((uint16_t)data[1] << 8));
