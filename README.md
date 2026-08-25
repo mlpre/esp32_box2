@@ -37,7 +37,7 @@ ESP_ERROR_CHECK(box2_motion_read(&motion));
 | ESP32-S3 / 16 MB Flash / 8 MB OPI PSRAM | 启动时读取容量并显示 |
 | I2C（GPIO48/47） | 扫描总线，预期发现 ES8389 `0x10`、SC7A20 `0x19` 和 TCA9555 `0x20` |
 | TCA9555 扩展 IO | 配置并回读电源、扬声器、USB、按键和充电状态引脚 |
-| SC7A20 三轴加速度计 | 校验 ID `0x11`，持续读取 X/Y/Z 原始值和 mg 值并判断六个方向 |
+| SC7A20 三轴加速度计 | 校验 ID `0x11`，配置 50 Hz 高精度模式，成组读取 X/Y/Z 并判断六个方向 |
 | ST7789 240×320 并口屏 | 显示 RGB 色条和实时测试面板 |
 | LCD 背光（GPIO21） | 启动时执行三档 PWM 亮度变化 |
 | ES8389 + I2S | 24 kHz 双工初始化、播放两段提示音、持续显示去除直流偏置后的麦克风峰值 |
@@ -47,21 +47,22 @@ ESP_ERROR_CHECK(box2_motion_read(&motion));
 | 2.4 GHz Wi-Fi | 主动扫描周围 AP，显示数量和最强信号，串口列出前 10 个 |
 | TF/MicroSD 卡 | SPI3 挂载 FAT 文件系统，显示卡名、容量、剩余空间并执行文件写入回读删除测试 |
 
-测试不会拉低 `SYS_POW`，也不会打开 `VBUS_EN`，避免 demo 在巡检中自行关机或向
-USB 口反向供电。
+测试初始化时写入 `BOX2_XIO_SAFE_OUTPUTS`，保持 `SYS_POW` 电源锁存，并回读确认
+TCA9555 输出状态。
 
-显示使用 5×7 单倍点阵字体，在 240×320 竖屏中同时显示 17 行硬件状态。动态状态每
-400 ms 更新，麦克风电平条支持独立局部更新，避免文字闪跳、覆盖和长行裁切。
+显示使用 5×7 单倍点阵字体和 PSRAM 全屏帧缓冲，在 240×320 竖屏中同时显示 17 行
+硬件状态。测试面板和麦克风电平条每 400 ms 一起刷新。
 
-SC7A20 与 ES8389、TCA9555 共用 I2C 总线，地址为 `0x19`。TF 卡使用原厂固件中的
-SPI3 引脚：SCLK GPIO17、MOSI GPIO16、MISO GPIO18、CS GPIO15，测试频率为 25 MHz。
-TF 卡应在上电前插入，并使用 FAT/FAT32/exFAT 文件系统；测试不会格式化卡，临时文件
-`/box2_test.tmp` 会在校验完成后自动删除。
+SC7A20、ES8389 和 TCA9555 共用 I2C 总线，7 位地址分别为 `0x19`、`0x10` 和 `0x20`。
+TF 卡使用 SPI3：SCLK GPIO17、MOSI GPIO16、MISO GPIO18、CS GPIO15，测试频率为
+25 MHz。TF 卡应在上电前插入，并使用 FAT/FAT32 文件系统；测试不会格式化卡，临时
+文件 `/sdcard/box2_test.tmp` 会在校验完成后自动删除。
 
 ## 编译与烧录
 
 本工程仅使用 ESP-IDF 6.0.2，并已完成完整编译验证。
 工程目标是 ESP32-S3 N16R8：16 MB Flash、8 MB OPI PSRAM，控制台使用 USB Serial/JTAG。
+`sdkconfig.defaults` 已将默认构建目标设为 `esp32s3`。
 
 ### 1. 准备 ESP-IDF 环境
 
@@ -79,13 +80,12 @@ idf.py --version
 干净源码中没有 `sdkconfig`、`dependencies.lock`、`managed_components` 和 `build`，执行：
 
 ```powershell
-idf.py set-target esp32s3
 idf.py build
 ```
 
 构建过程会自动完成以下工作：
 
-1. 根据 `sdkconfig.defaults` 生成 `sdkconfig`。
+1. 从 `sdkconfig.defaults` 选择 ESP32-S3 并生成 `sdkconfig`。
 2. 根据 `driver/idf_component.yml` 解析并下载 `espressif/esp_codec_dev`，同时生成 `dependencies.lock`。
 3. 在 `build` 中生成 Bootloader、分区表和应用固件。
 
@@ -153,7 +153,7 @@ idf.py fullclean
 
 需要完全回到干净源码状态时，还可以删除自动生成的 `build`、`managed_components`、
 `sdkconfig` 和 `dependencies.lock`；再次执行第 2 步即可恢复。不要删除
-`sdkconfig.defaults` 或 `main/idf_component.yml`。
+`sdkconfig.defaults` 或 `driver/idf_component.yml`。
 
 ## 上电现象和操作
 
