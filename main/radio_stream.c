@@ -15,11 +15,15 @@
 #include "esp_http_client.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_partition.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs.h"
 
 #define RADIO_TASK_STACK_SIZE (32 * 1024)
 #define HTTP_READ_SIZE 4096
+#define HTTP_AUDIO_BUFFER_SIZE (16 * 1024)
+#define HTTP_AUDIO_PREBUFFER_SIZE (12 * 1024)
 #define PCM_BUFFER_INITIAL_SIZE 8192
 #define RESAMPLE_OUTPUT_SAMPLES 4096
 #define RADIO_RETRY_DELAY_MS 2500
@@ -27,6 +31,13 @@
 #define RADIO_OUTPUT_RATE 24000
 #define DIRECTORY_MAX_STATIONS 1000
 #define DIRECTORY_MAX_BYTES (256 * 1024)
+#define DIRECTORY_CACHE_MAGIC 0x52414449UL
+#define DIRECTORY_CACHE_VERSION 1UL
+#define DIRECTORY_CACHE_SUBTYPE 0x40
+#define DIRECTORY_CACHE_LABEL "radio_cache"
+#define RADIO_NVS_NAMESPACE "radio"
+#define RADIO_INDEX_KEY "station"
+#define RADIO_VOLUME_KEY "volume"
 #define DIRECTORY_URL                                                                            \
     "https://de1.api.radio-browser.info/m3u/stations/search?countrycode=CN&codec=MP3"            \
     "&hidebroken=true&order=votes&reverse=true&removeDuplicates=true&limit=1000"
@@ -37,6 +48,14 @@ typedef struct
     char display_name[128];
     char url[256];
 } radio_station_t;
+
+typedef struct
+{
+    uint32_t magic;
+    uint32_t version;
+    uint32_t length;
+    uint32_t checksum;
+} directory_cache_header_t;
 
 typedef struct
 {
@@ -59,6 +78,7 @@ static radio_station_t *s_active_stations;
 static uint32_t s_generation = 1;
 static TaskHandle_t s_task;
 static bool s_initialized;
+static bool s_directory_update_requested;
 
 static void status_set_state(radio_state_t state, const char *error)
 {
@@ -306,12 +326,258 @@ static size_t parse_m3u_directory(char *playlist, radio_station_t *stations, siz
     return count;
 }
 
+static uint32_t directory_checksum(const uint8_t *data, size_t length)
+{
+    uint32_t crc = 0xffffffffU;
+    for (size_t i = 0; i < length; ++i)
+    {
+        crc ^= data[i];
+        for (unsigned bit = 0; bit < 8; ++bit)
+        {
+            crc = (crc >> 1) ^ (0xedb88320U & (0U - (crc & 1U)));
+        }
+    }
+    return ~crc;
+}
+
+static esp_err_t save_station_index(size_t station_index)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(RADIO_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    err = nvs_set_u32(handle, RADIO_INDEX_KEY, (uint32_t)station_index);
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+static esp_err_t save_volume(int volume_percent)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(RADIO_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    err = nvs_set_u8(handle, RADIO_VOLUME_KEY, (uint8_t)volume_percent);
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
+
+static void load_volume(void)
+{
+    nvs_handle_t handle;
+    uint8_t volume = 0;
+    esp_err_t err = nvs_open(RADIO_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_OK)
+    {
+        err = nvs_get_u8(handle, RADIO_VOLUME_KEY, &volume);
+        nvs_close(handle);
+    }
+    if (err == ESP_OK && volume <= 100)
+    {
+        portENTER_CRITICAL(&s_lock);
+        s_status.volume_percent = volume;
+        portEXIT_CRITICAL(&s_lock);
+        ESP_LOGI(TAG, "Loaded saved volume %u%%", (unsigned)volume);
+    }
+}
+
+static void load_station_index(void)
+{
+    nvs_handle_t handle;
+    uint32_t station_index = 0;
+    esp_err_t err = nvs_open(RADIO_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_OK)
+    {
+        err = nvs_get_u32(handle, RADIO_INDEX_KEY, &station_index);
+        nvs_close(handle);
+    }
+    if (err == ESP_OK)
+    {
+        portENTER_CRITICAL(&s_lock);
+        s_status.station_index = station_index;
+        portEXIT_CRITICAL(&s_lock);
+        ESP_LOGI(TAG, "Loaded saved station index %u", (unsigned)station_index);
+    }
+}
+
+static const esp_partition_t *directory_cache_partition(void)
+{
+    return esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA,
+        (esp_partition_subtype_t)DIRECTORY_CACHE_SUBTYPE,
+        DIRECTORY_CACHE_LABEL);
+}
+
+static esp_err_t save_station_directory(const uint8_t *playlist, size_t length)
+{
+    const esp_partition_t *partition = directory_cache_partition();
+    if (!partition || !playlist || length == 0 || length > DIRECTORY_MAX_BYTES ||
+        sizeof(directory_cache_header_t) + length > partition->size)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    directory_cache_header_t header = {
+        .magic = DIRECTORY_CACHE_MAGIC,
+        .version = DIRECTORY_CACHE_VERSION,
+        .length = (uint32_t)length,
+        .checksum = directory_checksum(playlist, length),
+    };
+    ESP_RETURN_ON_ERROR(esp_partition_erase_range(partition, 0, partition->size),
+                        TAG, "erase station cache");
+    ESP_RETURN_ON_ERROR(esp_partition_write(partition, 0, &header, sizeof(header)),
+                        TAG, "write station cache header");
+    return esp_partition_write(partition, sizeof(header), playlist, length);
+}
+
+static esp_err_t read_station_directory(uint8_t **playlist, size_t *length)
+{
+    const esp_partition_t *partition = directory_cache_partition();
+    if (!partition || !playlist || !length)
+    {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    directory_cache_header_t header = {0};
+    ESP_RETURN_ON_ERROR(esp_partition_read(partition, 0, &header, sizeof(header)),
+                        TAG, "read station cache header");
+    if (header.magic != DIRECTORY_CACHE_MAGIC ||
+        header.version != DIRECTORY_CACHE_VERSION || header.length == 0 ||
+        header.length > DIRECTORY_MAX_BYTES ||
+        sizeof(header) + header.length > partition->size)
+    {
+        return ESP_ERR_INVALID_VERSION;
+    }
+
+    uint8_t *data = heap_caps_malloc(header.length + 1,
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!data)
+    {
+        return ESP_ERR_NO_MEM;
+    }
+    esp_err_t err = esp_partition_read(partition, sizeof(header), data,
+                                       header.length);
+    if (err != ESP_OK || directory_checksum(data, header.length) != header.checksum)
+    {
+        free(data);
+        return err == ESP_OK ? ESP_ERR_INVALID_CRC : err;
+    }
+    data[header.length] = '\0';
+    *playlist = data;
+    *length = header.length;
+    return ESP_OK;
+}
+
+static esp_err_t install_station_directory(const uint8_t *playlist, size_t length,
+                                           bool persist)
+{
+    if (!playlist || length == 0 || length > DIRECTORY_MAX_BYTES)
+    {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    char *parse_buffer = heap_caps_malloc(length + 1,
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    radio_station_t *stations = heap_caps_calloc(
+        DIRECTORY_MAX_STATIONS, sizeof(*stations),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!parse_buffer || !stations)
+    {
+        free(parse_buffer);
+        free(stations);
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(parse_buffer, playlist, length);
+    parse_buffer[length] = '\0';
+    size_t station_count = parse_m3u_directory(parse_buffer, stations,
+                                               DIRECTORY_MAX_STATIONS);
+    free(parse_buffer);
+    if (station_count == 0)
+    {
+        free(stations);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    if (persist)
+    {
+        esp_err_t cache_err = save_station_directory(playlist, length);
+        if (cache_err != ESP_OK)
+        {
+            free(stations);
+            return cache_err;
+        }
+    }
+
+    bool reset_index = false;
+    portENTER_CRITICAL(&s_lock);
+    radio_station_t *old_stations = s_active_stations;
+    s_active_stations = stations;
+    s_status.station_count = station_count;
+    if (persist)
+    {
+        s_status.station_index = 0;
+        reset_index = true;
+    }
+    else if (s_status.station_index >= station_count)
+    {
+        s_status.station_index = 0;
+        reset_index = true;
+    }
+    ++s_generation;
+    portEXIT_CRITICAL(&s_lock);
+    free(old_stations);
+    if (reset_index)
+    {
+        esp_err_t index_err = save_station_index(0);
+        if (index_err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "Station index reset was not saved: %s",
+                     esp_err_to_name(index_err));
+        }
+    }
+    ESP_LOGI(TAG, "Installed %u cached MP3 stations", (unsigned)station_count);
+    return ESP_OK;
+}
+
+static esp_err_t load_initial_station_directory(void)
+{
+    uint8_t *cached_playlist = NULL;
+    size_t cached_length = 0;
+    esp_err_t cache_err = read_station_directory(&cached_playlist, &cached_length);
+    if (cache_err == ESP_OK)
+    {
+        esp_err_t install_err = install_station_directory(
+            cached_playlist, cached_length, false);
+        free(cached_playlist);
+        if (install_err == ESP_OK)
+        {
+            ESP_LOGI(TAG, "Loaded station directory from Flash cache");
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "Cached station directory invalid: %s",
+                 esp_err_to_name(install_err));
+    }
+
+    ESP_LOGI(TAG, "No station directory stored in Flash");
+    return ESP_OK;
+}
+
 static esp_err_t load_station_directory(void)
 {
     esp_err_t result = ESP_FAIL;
     esp_http_client_handle_t client = NULL;
     char *playlist = NULL;
-    radio_station_t *stations = NULL;
     size_t received = 0;
 
     status_set_state(RADIO_STATE_LOADING_DIRECTORY, NULL);
@@ -345,9 +611,7 @@ static esp_err_t load_station_directory(void)
 
     playlist = heap_caps_malloc(DIRECTORY_MAX_BYTES + 1,
                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    stations = heap_caps_calloc(DIRECTORY_MAX_STATIONS, sizeof(*stations),
-                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!playlist || !stations)
+    if (!playlist)
     {
         result = ESP_ERR_NO_MEM;
         goto cleanup;
@@ -369,28 +633,14 @@ static esp_err_t load_station_directory(void)
         received += (size_t)read_size;
     }
     playlist[received] = '\0';
-    size_t station_count = parse_m3u_directory(playlist, stations,
-                                               DIRECTORY_MAX_STATIONS);
-    if (station_count == 0)
+    result = install_station_directory((const uint8_t *)playlist, received, true);
+    if (result == ESP_OK)
     {
-        ESP_LOGW(TAG, "Directory returned no usable stations");
-        result = ESP_ERR_NOT_FOUND;
-        goto cleanup;
+        radio_status_t status = {0};
+        radio_stream_get_status(&status);
+        ESP_LOGI(TAG, "Updated and saved %u MP3 stations (%u playlist bytes)",
+                 (unsigned)status.station_count, (unsigned)received);
     }
-
-    portENTER_CRITICAL(&s_lock);
-    s_active_stations = stations;
-    s_status.station_count = station_count;
-    if (s_status.station_index >= station_count)
-    {
-        s_status.station_index = 0;
-    }
-    ++s_generation;
-    portEXIT_CRITICAL(&s_lock);
-    stations = NULL;
-    result = ESP_OK;
-    ESP_LOGI(TAG, "Loaded %u MP3 stations (%u playlist bytes)",
-             (unsigned)station_count, (unsigned)received);
 
 cleanup:
     if (client)
@@ -399,12 +649,11 @@ cleanup:
         esp_http_client_cleanup(client);
     }
     free(playlist);
-    free(stations);
     if (result != ESP_OK)
     {
-        ESP_LOGW(TAG, "Directory load failed (%s); retrying in %d ms",
-                 esp_err_to_name(result), DIRECTORY_RETRY_DELAY_MS);
-        status_set_state(RADIO_STATE_RETRYING, "电台目录加载失败，稍后重试");
+        ESP_LOGW(TAG, "Directory update failed (%s); keeping Flash cache",
+                 esp_err_to_name(result));
+        status_set_state(RADIO_STATE_RETRYING, "电台更新失败");
     }
     return result;
 }
@@ -491,7 +740,8 @@ static esp_err_t play_station(size_t station_index, uint32_t generation)
         goto cleanup;
     }
 
-    http_buffer = malloc(HTTP_READ_SIZE);
+    http_buffer = heap_caps_malloc(HTTP_AUDIO_BUFFER_SIZE,
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     pcm_buffer = malloc(pcm_capacity);
     resample_output = malloc(RESAMPLE_OUTPUT_SAMPLES * sizeof(int16_t));
     if (!http_buffer || !pcm_buffer || !resample_output)
@@ -502,21 +752,46 @@ static esp_err_t play_station(size_t station_index, uint32_t generation)
     }
 
     status_set_state(RADIO_STATE_BUFFERING, NULL);
+    size_t buffered = 0;
+    while (buffered < HTTP_AUDIO_PREBUFFER_SIZE &&
+           !selection_changed(generation))
+    {
+        int read_size = esp_http_client_read(
+            client, (char *)http_buffer + buffered,
+            HTTP_AUDIO_BUFFER_SIZE - buffered);
+        if (read_size <= 0)
+        {
+            snprintf(error_text, sizeof(error_text),
+                     "电台预缓冲失败 %d", read_size);
+            result = ESP_FAIL;
+            goto cleanup;
+        }
+        buffered += (size_t)read_size;
+        status_add_received((size_t)read_size);
+    }
+
     bool first_audio_frame = true;
     while (!selection_changed(generation))
     {
-        int read_size = esp_http_client_read(client, (char *)http_buffer, HTTP_READ_SIZE);
-        if (read_size <= 0)
+        if (buffered < HTTP_AUDIO_PREBUFFER_SIZE)
         {
-            snprintf(error_text, sizeof(error_text), "电台流已中断 %d", read_size);
-            result = ESP_FAIL;
-            break;
+            int read_size = esp_http_client_read(
+                client, (char *)http_buffer + buffered,
+                HTTP_AUDIO_BUFFER_SIZE - buffered);
+            if (read_size <= 0)
+            {
+                snprintf(error_text, sizeof(error_text),
+                         "电台流已中断 %d", read_size);
+                result = ESP_FAIL;
+                break;
+            }
+            buffered += (size_t)read_size;
+            status_add_received((size_t)read_size);
         }
-        status_add_received((size_t)read_size);
 
         esp_audio_simple_dec_raw_t raw = {
             .buffer = http_buffer,
-            .len = (uint32_t)read_size,
+            .len = (uint32_t)buffered,
             .eos = false,
         };
         while (raw.len && !selection_changed(generation))
@@ -576,6 +851,22 @@ static esp_err_t play_station(size_t station_index, uint32_t generation)
             raw.buffer += raw.consumed;
             raw.len -= raw.consumed;
         }
+
+        size_t remaining = raw.len;
+        if (remaining == buffered)
+        {
+            if (buffered == HTTP_AUDIO_BUFFER_SIZE)
+            {
+                snprintf(error_text, sizeof(error_text), "MP3帧超过缓冲区");
+                result = ESP_ERR_INVALID_SIZE;
+                goto cleanup;
+            }
+        }
+        else if (remaining)
+        {
+            memmove(http_buffer, raw.buffer, remaining);
+        }
+        buffered = remaining;
     }
 
 cleanup:
@@ -604,15 +895,27 @@ cleanup:
 static void radio_task(void *argument)
 {
     (void)argument;
-    while (load_station_directory() != ESP_OK)
-    {
-        vTaskDelay(pdMS_TO_TICKS(DIRECTORY_RETRY_DELAY_MS));
-    }
-
     uint32_t failed_generation = UINT32_MAX;
     unsigned consecutive_failures = 0;
     while (true)
     {
+        bool update_directory;
+        bool directory_missing;
+        portENTER_CRITICAL(&s_lock);
+        update_directory = s_directory_update_requested;
+        s_directory_update_requested = false;
+        directory_missing = s_status.station_count == 0;
+        portEXIT_CRITICAL(&s_lock);
+        if (update_directory || directory_missing)
+        {
+            esp_err_t directory_err = load_station_directory();
+            if (directory_err != ESP_OK && directory_missing)
+            {
+                vTaskDelay(pdMS_TO_TICKS(DIRECTORY_RETRY_DELAY_MS));
+                continue;
+            }
+        }
+
         size_t station_index;
         uint32_t generation;
         get_selection(&station_index, &generation);
@@ -654,8 +957,12 @@ esp_err_t radio_stream_init(void)
         status_set_state(RADIO_STATE_ERROR, "MP3解码器初始化失败");
         return ESP_FAIL;
     }
+    load_volume();
     ESP_RETURN_ON_ERROR(box2_audio_set_output_volume(s_status.volume_percent), TAG,
                         "set initial radio volume");
+    load_station_index();
+    ESP_RETURN_ON_ERROR(load_initial_station_directory(), TAG,
+                        "load station directory from Flash");
     s_initialized = true;
     return ESP_OK;
 }
@@ -675,11 +982,27 @@ esp_err_t radio_stream_start(void)
     return created == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
+void radio_stream_request_directory_update(void)
+{
+    portENTER_CRITICAL(&s_lock);
+    if (!s_directory_update_requested &&
+        s_status.state != RADIO_STATE_LOADING_DIRECTORY)
+    {
+        s_directory_update_requested = true;
+        s_status.state = RADIO_STATE_LOADING_DIRECTORY;
+        s_status.last_error[0] = '\0';
+        ++s_generation;
+    }
+    portEXIT_CRITICAL(&s_lock);
+}
+
 void radio_stream_select(size_t station_index)
 {
+    size_t selected_index;
     portENTER_CRITICAL(&s_lock);
     size_t count = s_status.station_count;
     s_status.station_index = count ? station_index % count : 0;
+    selected_index = s_status.station_index;
     s_status.source_sample_rate = 0;
     s_status.source_channels = 0;
     s_status.bitrate_kbps = 0;
@@ -687,6 +1010,11 @@ void radio_stream_select(size_t station_index)
     s_status.last_error[0] = '\0';
     ++s_generation;
     portEXIT_CRITICAL(&s_lock);
+    esp_err_t err = save_station_index(selected_index);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Station index was not saved: %s", esp_err_to_name(err));
+    }
 }
 
 void radio_stream_next(void)
@@ -719,6 +1047,12 @@ esp_err_t radio_stream_set_volume(int volume_percent)
         portENTER_CRITICAL(&s_lock);
         s_status.volume_percent = volume_percent;
         portEXIT_CRITICAL(&s_lock);
+        esp_err_t save_err = save_volume(volume_percent);
+        if (save_err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "Volume was not saved: %s",
+                     esp_err_to_name(save_err));
+        }
     }
     return err;
 }
@@ -734,17 +1068,25 @@ void radio_stream_get_status(radio_status_t *status)
     portEXIT_CRITICAL(&s_lock);
 }
 
-const char *radio_stream_station_name(size_t station_index)
+void radio_stream_get_station_name(size_t station_index, char *name,
+                                   size_t capacity)
 {
-    const char *name = "暂无电台";
+    if (!name || capacity == 0)
+    {
+        return;
+    }
     portENTER_CRITICAL(&s_lock);
     size_t count = s_status.station_count;
     if (count)
     {
-        name = s_active_stations[station_index % count].display_name;
+        strlcpy(name, s_active_stations[station_index % count].display_name,
+                capacity);
+    }
+    else
+    {
+        strlcpy(name, "暂无电台", capacity);
     }
     portEXIT_CRITICAL(&s_lock);
-    return name;
 }
 
 const char *radio_stream_state_name(radio_state_t state)
@@ -754,7 +1096,7 @@ const char *radio_stream_state_name(radio_state_t state)
     case RADIO_STATE_IDLE:
         return "待机";
     case RADIO_STATE_LOADING_DIRECTORY:
-        return "正在加载电台";
+        return "正在更新电台";
     case RADIO_STATE_CONNECTING:
         return "正在连接";
     case RADIO_STATE_BUFFERING:

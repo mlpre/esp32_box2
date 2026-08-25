@@ -165,25 +165,13 @@ esp_err_t box2_board_init(void)
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_RETURN_ON_ERROR(gpio_config(&key_cfg), TAG, "configure keys");
-    int l_high = 0;
-    int q_high = 0;
-    int m_high = 0;
-    int r_high = 0;
-    for (int i = 0; i < 16; ++i)
-    {
-        uint16_t keys = 0;
-        ESP_RETURN_ON_ERROR(tca_read_u16(TCA9555_REG_INPUT0, &keys), TAG,
-                            "calibrate key idle levels");
-        l_high += (keys & BOX2_XIO_KEY_L) != 0;
-        q_high += (keys & BOX2_XIO_KEY_Q) != 0;
-        m_high += (keys & BOX2_XIO_KEY_M) != 0;
-        r_high += gpio_get_level(BOX2_BUTTON_RIGHT) != 0;
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-    s_key_l_idle = l_high >= 8;
-    s_key_q_idle = q_high >= 8;
-    s_key_m_idle = m_high >= 8;
-    s_key_r_idle = r_high >= 8;
+    /* These levels are fixed by the BOX2 key circuit. Runtime calibration is
+       unsafe because a key held during deep-sleep wake would be learned as
+       the idle state and invert that key until the next reboot. */
+    s_key_l_idle = true;
+    s_key_q_idle = true;
+    s_key_m_idle = false;
+    s_key_r_idle = true;
     ESP_LOGI(TAG, "key idle levels: L(P5)=%d Q(P6)=%d M(P7)=%d R(GPIO0)=%d",
              s_key_l_idle, s_key_q_idle, s_key_m_idle, s_key_r_idle);
     const adc_oneshot_unit_init_cfg_t adc_unit_cfg = {
@@ -254,5 +242,17 @@ esp_err_t box2_board_read_state(box2_board_state_t *state, bool sample_battery)
         state->battery_percent = battery_percent_from_raw(raw);
         state->battery_mv_estimate = battery_mv_from_raw(raw);
     }
+    return ESP_OK;
+}
+
+esp_err_t box2_board_power_off(void)
+{
+    ESP_RETURN_ON_FALSE(s_tca9555, ESP_ERR_INVALID_STATE, TAG,
+                        "I/O expander is not initialized");
+    /* Keep SYS_POW asserted. Dropping it while USB is attached power-cycles the
+       board immediately; deep sleep below is the actual off state. */
+    uint16_t outputs = BOX2_XIO_SAFE_OUTPUTS & ~BOX2_XIO_SPK_EN;
+    ESP_RETURN_ON_ERROR(tca_write_u16(TCA9555_REG_OUTPUT0, outputs), TAG,
+                        "disable speaker for standby");
     return ESP_OK;
 }

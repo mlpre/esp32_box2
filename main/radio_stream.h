@@ -30,10 +30,12 @@ typedef struct
 
 esp_err_t radio_stream_init(void);
 esp_err_t radio_stream_start(void);
+void radio_stream_request_directory_update(void);
 void radio_stream_select(size_t station_index);
 void radio_stream_next(void);
 void radio_stream_previous(void);
 esp_err_t radio_stream_set_volume(int volume_percent);
 void radio_stream_get_status(radio_status_t *status);
-const char *radio_stream_station_name(size_t station_index);
+void radio_stream_get_station_name(size_t station_index, char *name,
+                                   size_t capacity);
 const char *radio_stream_state_name(radio_state_t state);

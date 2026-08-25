@@ -238,8 +238,17 @@ esp_err_t radio_screen_show(const radio_screen_data_t *data)
     ESP_RETURN_ON_ERROR(initialize_screen(), TAG, "initialize premium Chinese UI");
 
     char line[160];
-    set_label_text_if_changed(s_station_name,
-                              radio_stream_station_name(data->radio.station_index));
+    char station_name[128];
+    if (data->radio.state == RADIO_STATE_LOADING_DIRECTORY)
+    {
+        strlcpy(station_name, "正在更新电台", sizeof(station_name));
+    }
+    else
+    {
+        radio_stream_get_station_name(data->radio.station_index, station_name,
+                                      sizeof(station_name));
+    }
+    set_label_text_if_changed(s_station_name, station_name);
 
     if (data->weather.valid)
     {
@@ -295,8 +304,8 @@ esp_err_t radio_screen_show(const radio_screen_data_t *data)
     }
     else
     {
-        set_label_text_if_changed(s_date, "");
-        snprintf(line, sizeof(line), "--:--");
+        set_label_text_if_changed(s_date, "1月1日  星期一");
+        snprintf(line, sizeof(line), "00:00");
     }
     set_label_text_if_changed(s_top_time, line);
 

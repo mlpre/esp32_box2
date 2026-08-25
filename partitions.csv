@@ -2,3 +2,4 @@
 nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,
 factory,  app,  factory, 0x10000,  0x600000,
+radio_cache, data, 0x40, 0x610000, 0x50000,

@@ -14,7 +14,9 @@ idf_component_register(
         driver
         esp_audio_codec
         esp_event
+        esp_hw_support
         esp_http_client
+        esp_partition
         esp_netif
         mbedtls
         esp_wifi

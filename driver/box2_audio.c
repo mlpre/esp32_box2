@@ -22,6 +22,8 @@ esp_err_t box2_audio_init(i2c_master_bus_handle_t i2c_bus)
     }
     ESP_RETURN_ON_FALSE(i2c_bus, ESP_ERR_INVALID_ARG, TAG, "I2C bus is null");
     i2s_chan_config_t channel_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    channel_cfg.dma_desc_num = 12;
+    channel_cfg.dma_frame_num = 512;
     channel_cfg.auto_clear_after_cb = true;
     ESP_RETURN_ON_ERROR(i2s_new_channel(&channel_cfg, &s_tx_channel, &s_rx_channel),
                         TAG, "create duplex I2S");

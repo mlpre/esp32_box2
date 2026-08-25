@@ -11,12 +11,17 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "nvs.h"
 
 #define WEATHER_TASK_STACK_SIZE (10 * 1024)
 #define WEATHER_RESPONSE_CAPACITY 4096
-#define WEATHER_REFRESH_MS (30UL * 60UL * 1000UL)
+#define WEATHER_REFRESH_MS (10UL * 60UL * 1000UL)
 #define LOCATION_REFRESH_MS (6UL * 60UL * 60UL * 1000UL)
 #define RETRY_DELAY_MS (60UL * 1000UL)
+#define WEATHER_CACHE_MAGIC 0x57454154UL
+#define WEATHER_CACHE_VERSION 1UL
+#define WEATHER_NVS_NAMESPACE "weather"
+#define WEATHER_NVS_KEY "current"
 #define LOCATION_URL \
     "http://ipwho.is/?fields=success,city,latitude,longitude&lang=zh-CN"
 
@@ -28,10 +33,39 @@ typedef struct
     bool overflow;
 } http_response_t;
 
+typedef struct
+{
+    uint32_t magic;
+    uint32_t version;
+    weather_status_t status;
+} weather_cache_t;
+
 static const char *TAG = "weather_service";
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 static weather_status_t s_status;
 static TaskHandle_t s_task;
+
+static esp_err_t save_cached_status(const weather_status_t *status)
+{
+    weather_cache_t cache = {
+        .magic = WEATHER_CACHE_MAGIC,
+        .version = WEATHER_CACHE_VERSION,
+        .status = *status,
+    };
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WEATHER_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    err = nvs_set_blob(handle, WEATHER_NVS_KEY, &cache, sizeof(cache));
+    if (err == ESP_OK)
+    {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    return err;
+}
 
 static esp_err_t http_event_handler(esp_http_client_event_t *event)
 {
@@ -240,6 +274,12 @@ static void weather_task(void *argument)
         if (weather_err == ESP_OK)
         {
             publish_status(&next);
+            esp_err_t cache_err = save_cached_status(&next);
+            if (cache_err != ESP_OK)
+            {
+                ESP_LOGW(TAG, "Weather cache write failed: %s",
+                         esp_err_to_name(cache_err));
+            }
             ESP_LOGI(TAG, "Weather updated: %s, %d C", next.city,
                      next.temperature_c);
             vTaskDelay(pdMS_TO_TICKS(WEATHER_REFRESH_MS));
@@ -251,6 +291,43 @@ static void weather_task(void *argument)
             vTaskDelay(pdMS_TO_TICKS(RETRY_DELAY_MS));
         }
     }
+}
+
+esp_err_t weather_service_init(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WEATHER_NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_OK;
+    }
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+
+    weather_cache_t cache = {0};
+    size_t size = sizeof(cache);
+    err = nvs_get_blob(handle, WEATHER_NVS_KEY, &cache, &size);
+    nvs_close(handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        return ESP_OK;
+    }
+    if (err != ESP_OK)
+    {
+        return err;
+    }
+    if (size != sizeof(cache) || cache.magic != WEATHER_CACHE_MAGIC ||
+        cache.version != WEATHER_CACHE_VERSION || !cache.status.valid)
+    {
+        return ESP_ERR_INVALID_VERSION;
+    }
+
+    publish_status(&cache.status);
+    ESP_LOGI(TAG, "Loaded cached weather: %s, %d C", cache.status.city,
+             cache.status.temperature_c);
+    return ESP_OK;
 }
 
 esp_err_t weather_service_start(void)

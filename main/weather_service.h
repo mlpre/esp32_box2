@@ -25,4 +25,5 @@ typedef struct
 } weather_status_t;
 
 esp_err_t weather_service_start(void);
+esp_err_t weather_service_init(void);
 void weather_service_get_status(weather_status_t *status);
