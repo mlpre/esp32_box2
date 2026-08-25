@@ -29,80 +29,65 @@
 #define KEY_LONG_PRESS_MS 2000
 #define WAKE_PIN_STABLE_MS 150
 #define BATTERY_REFRESH_MS 10000
-#define SCREEN_IDLE_TIMEOUT_MS 30000
-#define MOTION_THRESHOLD_MG 20
-#define MOTION_FAST_FILTER_SHIFT 2
-#define MOTION_BASELINE_FILTER_SHIFT 6
+#define FACE_DOWN_ENTER_Z_MG (-700)
+#define FACE_DOWN_EXIT_Z_MG (-450)
+#define FACE_DOWN_ENTER_STABLE_MS 500
+#define FACE_DOWN_EXIT_STABLE_MS 120
 #define SCREEN_BRIGHTNESS_PERCENT 100
-#define VOLUME_STEP 5
+#define VOLUME_CYCLE_STEP 10
 
 static const char *TAG = "box2_radio";
 static EventGroupHandle_t s_wifi_events;
 static char s_ip_address[16] = "-";
-
-typedef struct
-{
-    bool initialized;
-    int32_t fast_x_q8;
-    int32_t fast_y_q8;
-    int32_t fast_z_q8;
-    int32_t baseline_x_q8;
-    int32_t baseline_y_q8;
-    int32_t baseline_z_q8;
-} motion_filter_t;
+static const uint16_t s_shutdown_options_minutes[] = {
+    0, 5, 10, 20, 30, 60, 90, 120,
+};
+static size_t s_shutdown_option_index;
+static TickType_t s_shutdown_started;
 
 static int32_t abs_i32(int32_t value)
 {
     return value < 0 ? -value : value;
 }
 
-static bool motion_filter_update(motion_filter_t *filter,
-                                 const box2_motion_state_t *sample)
+static bool motion_face_down(const box2_motion_state_t *sample,
+                             bool use_exit_threshold)
 {
-    int32_t x_q8 = (int32_t)sample->x_mg << 8;
-    int32_t y_q8 = (int32_t)sample->y_mg << 8;
-    int32_t z_q8 = (int32_t)sample->z_mg << 8;
-    if (!filter->initialized)
+    int threshold = use_exit_threshold ? FACE_DOWN_EXIT_Z_MG
+                                       : FACE_DOWN_ENTER_Z_MG;
+    int32_t abs_z = abs_i32(sample->z_mg);
+    return sample->z_mg <= threshold &&
+           abs_z > abs_i32(sample->x_mg) &&
+           abs_z > abs_i32(sample->y_mg);
+}
+
+static void shutdown_timer_select_next(TickType_t now)
+{
+    s_shutdown_option_index =
+        (s_shutdown_option_index + 1) %
+        (sizeof(s_shutdown_options_minutes) /
+         sizeof(s_shutdown_options_minutes[0]));
+    uint16_t minutes = s_shutdown_options_minutes[s_shutdown_option_index];
+    if (minutes == 0)
     {
-        filter->initialized = true;
-        filter->fast_x_q8 = x_q8;
-        filter->fast_y_q8 = y_q8;
-        filter->fast_z_q8 = z_q8;
-        filter->baseline_x_q8 = x_q8;
-        filter->baseline_y_q8 = y_q8;
-        filter->baseline_z_q8 = z_q8;
-        return false;
+        s_shutdown_started = 0;
+        ESP_LOGI(TAG, "Shutdown timer cancelled");
+        return;
     }
 
-    /* The fast low-pass follows hand movement, while the slow baseline tracks
-       the resting orientation. Comparing those two rejects the speaker's
-       high-frequency vibration without losing gentle pick-up/tilt gestures. */
-    filter->fast_x_q8 +=
-        (x_q8 - filter->fast_x_q8) >> MOTION_FAST_FILTER_SHIFT;
-    filter->fast_y_q8 +=
-        (y_q8 - filter->fast_y_q8) >> MOTION_FAST_FILTER_SHIFT;
-    filter->fast_z_q8 +=
-        (z_q8 - filter->fast_z_q8) >> MOTION_FAST_FILTER_SHIFT;
-    filter->baseline_x_q8 +=
-        (filter->fast_x_q8 - filter->baseline_x_q8) >>
-        MOTION_BASELINE_FILTER_SHIFT;
-    filter->baseline_y_q8 +=
-        (filter->fast_y_q8 - filter->baseline_y_q8) >>
-        MOTION_BASELINE_FILTER_SHIFT;
-    filter->baseline_z_q8 +=
-        (filter->fast_z_q8 - filter->baseline_z_q8) >>
-        MOTION_BASELINE_FILTER_SHIFT;
+    s_shutdown_started = now;
+    ESP_LOGI(TAG, "Shutdown timer set to %u minutes", (unsigned)minutes);
+}
 
-    int32_t delta_x =
-        abs_i32(filter->fast_x_q8 - filter->baseline_x_q8) >> 8;
-    int32_t delta_y =
-        abs_i32(filter->fast_y_q8 - filter->baseline_y_q8) >> 8;
-    int32_t delta_z =
-        abs_i32(filter->fast_z_q8 - filter->baseline_z_q8) >> 8;
-
-    return delta_x >= MOTION_THRESHOLD_MG ||
-           delta_y >= MOTION_THRESHOLD_MG ||
-           delta_z >= MOTION_THRESHOLD_MG;
+static bool shutdown_timer_due(TickType_t now)
+{
+    uint16_t minutes = s_shutdown_options_minutes[s_shutdown_option_index];
+    if (minutes == 0)
+    {
+        return false;
+    }
+    return (now - s_shutdown_started) >=
+           pdMS_TO_TICKS((uint32_t)minutes * 60000U);
 }
 
 static esp_err_t storage_init(void)
@@ -309,7 +294,14 @@ static void handle_keys(const box2_board_state_t *board, radio_status_t *radio,
 
     if (left_pressed && !previous_left)
     {
-        radio_stream_set_volume(radio->volume_percent - VOLUME_STEP);
+        int next_volume = radio->volume_percent >= 100
+                              ? 0
+                              : radio->volume_percent + VOLUME_CYCLE_STEP;
+        if (next_volume > 100)
+        {
+            next_volume = 100;
+        }
+        radio_stream_set_volume(next_volume);
     }
     if (right_pressed && !previous_right)
     {
@@ -344,7 +336,7 @@ static void handle_keys(const box2_board_state_t *board, radio_status_t *radio,
     if (!middle_pressed && previous_middle &&
         !middle_long_press_triggered)
     {
-        radio_stream_set_volume(radio->volume_percent + VOLUME_STEP);
+        shutdown_timer_select_next(now);
     }
 
     previous_left = left_pressed;
@@ -390,8 +382,8 @@ void app_main(void)
     bool weather_started = false;
     TickType_t last_ui = 0;
     TickType_t last_battery = xTaskGetTickCount();
-    TickType_t last_motion = last_battery;
-    motion_filter_t motion_filter = {0};
+    TickType_t face_down_since = 0;
+    TickType_t face_up_since = 0;
     bool screen_on = true;
 
     while (true)
@@ -403,31 +395,55 @@ void app_main(void)
             esp_err_t motion_err = box2_motion_read(&motion);
             if (motion_err == ESP_OK)
             {
-                if (motion_filter_update(&motion_filter, &motion))
+                if (screen_on)
                 {
-                    last_motion = now;
-                    if (!screen_on)
+                    if (motion_face_down(&motion, false))
                     {
-                        ESP_LOGI(TAG, "Movement detected; waking screen");
+                        if (face_down_since == 0)
+                        {
+                            face_down_since = now;
+                        }
+                        else if ((now - face_down_since) >=
+                                 pdMS_TO_TICKS(FACE_DOWN_ENTER_STABLE_MS))
+                        {
+                            ESP_LOGI(TAG, "Screen placed face down; screen off");
+                            ESP_ERROR_CHECK_WITHOUT_ABORT(
+                                box2_lcd_set_backlight(0));
+                            screen_on = false;
+                            face_up_since = 0;
+                        }
+                    }
+                    else
+                    {
+                        face_down_since = 0;
+                    }
+                }
+                else if (motion_face_down(&motion, true))
+                {
+                    face_up_since = 0;
+                }
+                else
+                {
+                    if (face_up_since == 0)
+                    {
+                        face_up_since = now;
+                    }
+                    else if ((now - face_up_since) >=
+                             pdMS_TO_TICKS(FACE_DOWN_EXIT_STABLE_MS))
+                    {
+                        ESP_LOGI(TAG, "Screen uncovered; waking screen");
                         ESP_ERROR_CHECK_WITHOUT_ABORT(
                             radio_screen_force_redraw());
                         ESP_ERROR_CHECK_WITHOUT_ABORT(
                             box2_lcd_set_backlight(SCREEN_BRIGHTNESS_PERCENT));
                         screen_on = true;
+                        face_down_since = 0;
                     }
-                }
-                else if (screen_on &&
-                         (now - last_motion) >=
-                             pdMS_TO_TICKS(SCREEN_IDLE_TIMEOUT_MS))
-                {
-                    ESP_LOGI(TAG, "No movement for 30 seconds; screen off");
-                    ESP_ERROR_CHECK_WITHOUT_ABORT(box2_lcd_set_backlight(0));
-                    screen_on = false;
                 }
             }
             else
             {
-                ESP_LOGW(TAG, "Motion read failed (%s); disabling screen timeout",
+                ESP_LOGW(TAG, "Motion read failed (%s); disabling face-down screen control",
                          esp_err_to_name(motion_err));
                 motion_available = false;
                 if (!screen_on)
@@ -460,6 +476,13 @@ void app_main(void)
         radio_status_t radio = {0};
         radio_stream_get_status(&radio);
         handle_keys(&board, &radio, now);
+        if (shutdown_timer_due(now))
+        {
+            ESP_LOGI(TAG, "Shutdown timer expired");
+            s_shutdown_option_index = 0;
+            s_shutdown_started = 0;
+            power_off_after_key_release();
+        }
 
         if ((now - last_ui) >= pdMS_TO_TICKS(UI_REFRESH_MS))
         {
@@ -475,6 +498,8 @@ void app_main(void)
                 .charging = board.charging,
                 .radio = radio,
                 .weather = weather,
+                .shutdown_minutes =
+                    s_shutdown_options_minutes[s_shutdown_option_index],
             };
             ESP_ERROR_CHECK_WITHOUT_ABORT(radio_screen_show(&screen));
             last_ui = now;

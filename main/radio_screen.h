@@ -15,6 +15,7 @@ typedef struct
     bool charging;
     radio_status_t radio;
     weather_status_t weather;
+    uint16_t shutdown_minutes;
 } radio_screen_data_t;
 
 esp_err_t radio_screen_show(const radio_screen_data_t *data);

@@ -29,6 +29,8 @@ static lv_obj_t *s_weather_summary;
 static lv_obj_t *s_weather_temperature;
 static lv_obj_t *s_date;
 static lv_obj_t *s_station_name;
+static lv_obj_t *s_station_accent;
+static lv_obj_t *s_shutdown_timer;
 static const lv_image_dsc_t *s_last_weather_image;
 
 static const char *weather_text(weather_icon_t icon)
@@ -214,14 +216,23 @@ static esp_err_t initialize_screen(void)
     lv_obj_set_style_text_align(s_date, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_style_text_color(s_date, lv_color_hex(0x8FA3B6), LV_PART_MAIN);
 
-    lv_obj_t *station_accent = lv_obj_create(hero);
-    lv_obj_remove_style_all(station_accent);
-    lv_obj_set_size(station_accent, 28, 3);
-    lv_obj_align(station_accent, LV_ALIGN_TOP_MID, 0, 159);
-    lv_obj_set_style_bg_color(station_accent, lv_color_hex(0x53BDEB),
+    s_station_accent = lv_obj_create(hero);
+    lv_obj_remove_style_all(s_station_accent);
+    lv_obj_set_size(s_station_accent, 28, 3);
+    lv_obj_align(s_station_accent, LV_ALIGN_TOP_MID, 0, 159);
+    lv_obj_set_style_bg_color(s_station_accent, lv_color_hex(0x53BDEB),
                               LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(station_accent, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(station_accent, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_station_accent, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(s_station_accent, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+
+    s_shutdown_timer = make_label(hero, 0, 153, 204, 24);
+    lv_obj_align(s_shutdown_timer, LV_ALIGN_TOP_MID, 0, 153);
+    lv_obj_set_style_text_font(s_shutdown_timer, &radio_font_16, LV_PART_MAIN);
+    lv_obj_set_style_text_align(s_shutdown_timer, LV_TEXT_ALIGN_CENTER,
+                                LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_shutdown_timer, lv_color_hex(0x53BDEB),
+                                LV_PART_MAIN);
+    lv_obj_add_flag(s_shutdown_timer, LV_OBJ_FLAG_HIDDEN);
 
     s_station_name = make_label(hero, 0, 0, 204, 64);
     lv_obj_align(s_station_name, LV_ALIGN_TOP_MID, 0, 178);
@@ -233,8 +244,8 @@ static esp_err_t initialize_screen(void)
     lv_label_set_long_mode(s_station_name, LV_LABEL_LONG_WRAP);
 
     make_action_icon(screen, 10, LV_SYMBOL_PREV);
-    make_action_icon(screen, 70, LV_SYMBOL_MINUS);
-    make_action_icon(screen, 130, LV_SYMBOL_PLUS);
+    make_action_icon(screen, 70, LV_SYMBOL_VOLUME_MAX);
+    make_action_icon(screen, 130, LV_SYMBOL_BELL);
     make_action_icon(screen, 190, LV_SYMBOL_NEXT);
     return ESP_OK;
 }
@@ -256,6 +267,32 @@ esp_err_t radio_screen_show(const radio_screen_data_t *data)
                                       sizeof(station_name));
     }
     set_label_text_if_changed(s_station_name, station_name);
+
+    if (data->shutdown_minutes > 0)
+    {
+        if (data->shutdown_minutes == 90)
+        {
+            snprintf(line, sizeof(line), "1.5小时后关机");
+        }
+        else if (data->shutdown_minutes >= 60)
+        {
+            snprintf(line, sizeof(line), "%u小时后关机",
+                     (unsigned)(data->shutdown_minutes / 60));
+        }
+        else
+        {
+            snprintf(line, sizeof(line), "%u分钟后关机",
+                     (unsigned)data->shutdown_minutes);
+        }
+        set_label_text_if_changed(s_shutdown_timer, line);
+        lv_obj_add_flag(s_station_accent, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_shutdown_timer, LV_OBJ_FLAG_HIDDEN);
+    }
+    else
+    {
+        lv_obj_add_flag(s_shutdown_timer, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_station_accent, LV_OBJ_FLAG_HIDDEN);
+    }
 
     if (data->weather.valid)
     {
