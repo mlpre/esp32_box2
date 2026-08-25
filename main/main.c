@@ -16,6 +16,7 @@
 #include "nvs_flash.h"
 #include "radio_screen.h"
 #include "radio_stream.h"
+#include "weather_service.h"
 
 #define WIFI_CONNECTED_BIT BIT0
 #define UI_REFRESH_MS 300
@@ -162,6 +163,7 @@ void app_main(void)
     box2_board_state_t board = {0};
     ESP_ERROR_CHECK_WITHOUT_ABORT(box2_board_read_state(&board, true));
     bool radio_started = false;
+    bool weather_started = false;
     TickType_t last_ui = 0;
     TickType_t last_battery = xTaskGetTickCount();
 
@@ -180,6 +182,10 @@ void app_main(void)
             ESP_ERROR_CHECK(radio_stream_start());
             radio_started = true;
         }
+        if (connected && !weather_started)
+        {
+            weather_started = weather_service_start() == ESP_OK;
+        }
 
         radio_status_t radio = {0};
         radio_stream_get_status(&radio);
@@ -188,6 +194,8 @@ void app_main(void)
         if ((now - last_ui) >= pdMS_TO_TICKS(UI_REFRESH_MS))
         {
             radio_stream_get_status(&radio);
+            weather_status_t weather = {0};
+            weather_service_get_status(&weather);
             radio_screen_data_t screen = {
                 .wifi_configured = wifi_configured,
                 .wifi_connected = connected,
@@ -196,6 +204,7 @@ void app_main(void)
                 .battery_percent = board.battery_percent,
                 .charging = board.charging,
                 .radio = radio,
+                .weather = weather,
             };
             ESP_ERROR_CHECK_WITHOUT_ABORT(radio_screen_show(&screen));
             last_ui = now;

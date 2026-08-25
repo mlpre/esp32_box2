@@ -9,6 +9,9 @@ extern "C" {
 /** Project-local 16 px Unicode bitmap font; no external font component. */
 extern const lv_font_t radio_font_16;
 
+/** 20 px UI variant, scaled from the same project-local bitmap. */
+extern const lv_font_t radio_font_20;
+
 /** 24 px presentation variant, scaled from the same project-local bitmap. */
 extern const lv_font_t radio_font_24;
 

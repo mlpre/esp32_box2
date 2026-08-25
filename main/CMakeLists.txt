@@ -4,9 +4,12 @@ idf_component_register(
         "radio_font.c"
         "radio_screen.c"
         "radio_stream.c"
+        "weather_service.c"
+        "weather_icons.c"
     INCLUDE_DIRS "."
     EMBED_FILES
         "radio_font.bin"
+        "weather_icons.bin"
     PRIV_REQUIRES
         driver
         esp_audio_codec
@@ -17,4 +20,5 @@ idf_component_register(
         esp_wifi
         lvgl
         nvs_flash
+        cjson
 )

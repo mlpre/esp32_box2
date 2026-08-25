@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include "esp_err.h"
 #include "radio_stream.h"
+#include "weather_service.h"
 
 typedef struct
 {
@@ -13,6 +14,7 @@ typedef struct
     int battery_percent;
     bool charging;
     radio_status_t radio;
+    weather_status_t weather;
 } radio_screen_data_t;
 
 esp_err_t radio_screen_show(const radio_screen_data_t *data);

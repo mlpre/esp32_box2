@@ -121,6 +121,79 @@ const lv_font_t radio_font_16 = {
     .user_data = NULL,
 };
 
+static bool get_glyph_dsc_20(const lv_font_t *font, lv_font_glyph_dsc_t *dsc,
+                             uint32_t letter, uint32_t letter_next)
+{
+    (void)font;
+    (void)letter_next;
+
+    uint32_t index;
+    uint8_t advance;
+    if (!find_glyph(letter, &index, &advance))
+    {
+        return false;
+    }
+
+    dsc->adv_w = advance * 5 / 4;
+    dsc->box_w = 20;
+    dsc->box_h = 20;
+    dsc->ofs_x = 0;
+    dsc->ofs_y = 0;
+    dsc->format = LV_FONT_GLYPH_FORMAT_A1;
+    dsc->is_placeholder = false;
+    dsc->gid.index = index + 1;
+    return true;
+}
+
+static const void *get_glyph_bitmap_20(lv_font_glyph_dsc_t *dsc,
+                                       lv_draw_buf_t *draw_buf)
+{
+    if (!draw_buf || !draw_buf->data || dsc->gid.index == 0)
+    {
+        return NULL;
+    }
+
+    const size_t font_size = (size_t)(radio_font_bin_end - radio_font_bin_start);
+    if (font_size != RADIO_FONT_EXPECTED_BYTES)
+    {
+        return NULL;
+    }
+
+    const uint32_t index = dsc->gid.index - 1;
+    const uint8_t *packed = radio_font_bin_start + index * RADIO_FONT_GLYPH_BYTES;
+    uint8_t *output = draw_buf->data;
+    const uint32_t stride = draw_buf->header.stride;
+
+    for (uint32_t y = 0; y < 20; ++y)
+    {
+        const uint32_t source_y = y * 4 / 5;
+        const uint16_t row = ((uint16_t)packed[source_y * 2] << 8) |
+                             packed[source_y * 2 + 1];
+        for (uint32_t x = 0; x < 20; ++x)
+        {
+            const uint32_t source_x = x * 4 / 5;
+            output[y * stride + x] =
+                (row & (0x8000U >> source_x)) ? 0xff : 0x00;
+        }
+    }
+    return draw_buf;
+}
+
+const lv_font_t radio_font_20 = {
+    .get_glyph_dsc = get_glyph_dsc_20,
+    .get_glyph_bitmap = get_glyph_bitmap_20,
+    .release_glyph = NULL,
+    .line_height = 23,
+    .base_line = 3,
+    .subpx = LV_FONT_SUBPX_NONE,
+    .kerning = LV_FONT_KERNING_NONE,
+    .underline_position = -2,
+    .underline_thickness = 1,
+    .dsc = NULL,
+    .fallback = NULL,
+    .user_data = NULL,
+};
+
 static bool get_glyph_dsc_24(const lv_font_t *font, lv_font_glyph_dsc_t *dsc,
                              uint32_t letter, uint32_t letter_next)
 {
