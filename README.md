@@ -55,9 +55,9 @@ USB，设备会进入深度睡眠；重新上电或按复位键可再次启动�
 
 工程使用 ESP-IDF 6.0.2，目标必须是 ESP32-S3：
 
+先打开已配置好 ESP-IDF 6.0.2 环境的 PowerShell，进入项目根目录，然后执行：
+
 ```powershell
-cd C:\Users\ML\Documents\esp32_box2
-. C:\Espressif\tools\Microsoft.v6.0.2.PowerShell_profile.ps1
 idf.py set-target esp32s3
 idf.py build
 idf.py -p COM7 flash monitor
