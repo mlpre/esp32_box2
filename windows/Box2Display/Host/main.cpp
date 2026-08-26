@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include <winsock2.h>
+#include <mstcpip.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
@@ -16,6 +17,10 @@
 #include <thread>
 #include <vector>
 
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+
 namespace
 {
 constexpr wchar_t kStopEventName[] = L"Local\\Box2DisplayHostStop";
@@ -27,6 +32,7 @@ constexpr unsigned int kLcdWidth = 320;
 constexpr unsigned int kLcdHeight = 240;
 constexpr size_t kCaptureBytes = kLcdWidth * kLcdHeight * 3;
 constexpr size_t kMaxJpegBytes = kLcdWidth * kLcdHeight * sizeof(uint16_t);
+constexpr size_t kFragmentPayloadBytes = 1400;
 constexpr float kJpegQuality = 0.80f;
 bool g_Verbose = false;
 
@@ -110,13 +116,16 @@ struct StreamAck
     uint16_t Status;
 };
 
-struct JpegFrameHeader
+struct UdpFragmentHeader
 {
     char Magic[4];
-    uint32_t PayloadBytes;
+    uint32_t FrameBytes;
     uint32_t Sequence;
-    uint16_t Width;
-    uint16_t Height;
+    uint16_t FragmentIndex;
+    uint16_t FragmentCount;
+    uint32_t FragmentOffset;
+    uint16_t PayloadBytes;
+    uint16_t Reserved;
 };
 #pragma pack(pop)
 
@@ -438,16 +447,16 @@ private:
             {
                 continue;
             }
-            JpegFrameHeader header = {
-                {'B', '2', 'J', '3'},
-                htonl(static_cast<uint32_t>(jpeg.size())),
-                htonl(sequence),
-                htons(static_cast<uint16_t>(kLcdWidth)),
-                htons(static_cast<uint16_t>(kLcdHeight)),
-            };
-            if (!SendAll(reinterpret_cast<const uint8_t*>(&header),
-                         sizeof(header)) ||
-                !SendAll(jpeg.data(), jpeg.size()))
+            if (GetTickCount64() >= m_NextSessionRefresh)
+            {
+                if (!RefreshStreamSession())
+                {
+                    CloseSocket();
+                    continue;
+                }
+                m_NextSessionRefresh = GetTickCount64() + 1000;
+            }
+            if (!SendUdpFrame(jpeg, sequence))
             {
                 CloseSocket();
             }
@@ -569,7 +578,7 @@ private:
         {
             if (g_Verbose) fwprintf(stderr, L"Discovery send failed: %d\n", WSAGetLastError());
             closesocket(discovery);
-            return false;
+            return ConnectOnLocalSubnets();
         }
 
         DiscoveryReply reply = {};
@@ -589,13 +598,18 @@ private:
         }
 
         board.sin_port = reply.StreamPort;
-        return ConnectToAddress(board, false);
+        if (ConnectToAddress(board, false))
+        {
+            return true;
+        }
+        return ConnectOnLocalSubnets();
     }
 
     bool ConnectToAddress(sockaddr_in Board, bool NonBlocking,
                           uint32_t LocalAddress = 0)
     {
-        SOCKET stream = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        UNREFERENCED_PARAMETER(NonBlocking);
+        SOCKET stream = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (stream == INVALID_SOCKET)
         {
             return false;
@@ -612,92 +626,54 @@ private:
                 return false;
             }
         }
-        if (NonBlocking)
-        {
-            u_long enabled = 1;
-            ioctlsocket(stream, FIONBIO, &enabled);
-        }
-
-        int connectResult = connect(stream, reinterpret_cast<sockaddr*>(&Board),
-                                    sizeof(Board));
-        if (connectResult == SOCKET_ERROR && NonBlocking &&
-            WSAGetLastError() == WSAEWOULDBLOCK)
-        {
-            fd_set writable;
-            fd_set failed;
-            FD_ZERO(&writable);
-            FD_ZERO(&failed);
-            FD_SET(stream, &writable);
-            FD_SET(stream, &failed);
-            timeval timeout = {0, 8000};
-            int selected = select(0, nullptr, &writable, &failed, &timeout);
-            int socketError = 1;
-            int socketErrorLength = sizeof(socketError);
-            if (selected > 0 && FD_ISSET(stream, &writable))
-            {
-                getsockopt(stream, SOL_SOCKET, SO_ERROR,
-                           reinterpret_cast<char*>(&socketError),
-                           &socketErrorLength);
-            }
-            connectResult = socketError == 0 ? 0 : SOCKET_ERROR;
-        }
-        if (connectResult == SOCKET_ERROR)
+        if (connect(stream, reinterpret_cast<sockaddr*>(&Board),
+                    sizeof(Board)) == SOCKET_ERROR)
         {
             closesocket(stream);
             return false;
         }
-        if (NonBlocking)
-        {
-            u_long disabled = 0;
-            ioctlsocket(stream, FIONBIO, &disabled);
-        }
-        BOOL noDelay = TRUE;
-        DWORD sendTimeout = 1500;
-        DWORD receiveTimeout = NonBlocking ? 120 : 600;
-        setsockopt(stream, IPPROTO_TCP, TCP_NODELAY,
-                   reinterpret_cast<const char*>(&noDelay), sizeof(noDelay));
+        int sendBufferBytes = static_cast<int>(kMaxJpegBytes * 2);
+        DWORD sendTimeout = 100;
+        DWORD receiveTimeout = 600;
+        setsockopt(stream, SOL_SOCKET, SO_SNDBUF,
+                   reinterpret_cast<const char*>(&sendBufferBytes),
+                   sizeof(sendBufferBytes));
         setsockopt(stream, SOL_SOCKET, SO_SNDTIMEO,
                    reinterpret_cast<const char*>(&sendTimeout), sizeof(sendTimeout));
         setsockopt(stream, SOL_SOCKET, SO_RCVTIMEO,
                    reinterpret_cast<const char*>(&receiveTimeout), sizeof(receiveTimeout));
 
-        StreamHello hello = {{'B', '2', 'D', 'S'}, htons(3),
+        // Connected UDP sockets on Windows report asynchronous ICMP errors on
+        // a later receive/send by default. The v4 handshake already verifies
+        // the endpoint, so keep transient ICMP state from tearing down video.
+        BOOL reportUdpReset = FALSE;
+        DWORD bytesReturned = 0;
+        WSAIoctl(stream, SIO_UDP_CONNRESET, &reportUdpReset,
+                 sizeof(reportUdpReset), nullptr, 0, &bytesReturned,
+                 nullptr, nullptr);
+
+        StreamHello hello = {{'B', '2', 'D', 'S'}, htons(4),
                              htons(static_cast<uint16_t>(kLcdWidth)),
                              htons(static_cast<uint16_t>(kLcdHeight)), htons(2)};
-        size_t helloSent = 0;
-        while (helloSent < sizeof(hello))
+        if (send(stream, reinterpret_cast<const char*>(&hello), sizeof(hello), 0) !=
+            sizeof(hello))
         {
-            int result = send(stream,
-                              reinterpret_cast<const char*>(&hello) + helloSent,
-                              static_cast<int>(sizeof(hello) - helloSent), 0);
-            if (result <= 0)
-            {
-                closesocket(stream);
-                return false;
-            }
-            helloSent += static_cast<size_t>(result);
+            closesocket(stream);
+            return false;
         }
         StreamAck ack = {};
-        size_t ackReceived = 0;
-        while (ackReceived < sizeof(ack))
-        {
-            int result = recv(stream, reinterpret_cast<char*>(&ack) + ackReceived,
-                              static_cast<int>(sizeof(ack) - ackReceived), 0);
-            if (result <= 0)
-            {
-                closesocket(stream);
-                return false;
-            }
-            ackReceived += static_cast<size_t>(result);
-        }
-        if (memcmp(ack.Magic, "B2DA", 4) != 0 || ntohs(ack.Version) != 3 ||
+        int received = recv(stream, reinterpret_cast<char*>(&ack), sizeof(ack), 0);
+        if (received != sizeof(ack) || memcmp(ack.Magic, "B2DA", 4) != 0 ||
+            ntohs(ack.Version) != 4 ||
             ntohs(ack.Status) != 0)
         {
             closesocket(stream);
             return false;
         }
         m_Socket = stream;
-        if (g_Verbose) fwprintf(stderr, L"Connected to BOX-2 MJPEG stream.\n");
+        m_NextSessionRefresh = GetTickCount64() + 1000;
+        if (g_Verbose)
+            fwprintf(stderr, L"Connected to BOX-2 fragmented UDP stream.\n");
         return true;
     }
 
@@ -766,42 +742,148 @@ private:
             }
         }
 
-        bool connected = false;
         for (uint32_t localAddress : localAddresses)
         {
-            uint32_t network = localAddress & 0xFFFFFF00u;
-            uint32_t localHost = localAddress & 0xFFu;
-            for (uint32_t offset = 1; offset < 255 && !connected; ++offset)
+            SOCKET discovery = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            if (discovery == INVALID_SOCKET)
             {
-                uint32_t host = ((localHost - 1 + offset) % 254) + 1;
-                uint32_t candidate = network | host;
-                sockaddr_in board = {};
-                board.sin_family = AF_INET;
-                board.sin_port = htons(5000);
-                board.sin_addr.s_addr = htonl(candidate);
-                connected = ConnectToAddress(board, true, localAddress);
+                continue;
             }
-            if (connected)
+            BOOL broadcastEnabled = TRUE;
+            DWORD timeout = 250;
+            setsockopt(discovery, SOL_SOCKET, SO_BROADCAST,
+                       reinterpret_cast<const char*>(&broadcastEnabled),
+                       sizeof(broadcastEnabled));
+            setsockopt(discovery, SOL_SOCKET, SO_RCVTIMEO,
+                       reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+            sockaddr_in local = {};
+            local.sin_family = AF_INET;
+            local.sin_addr.s_addr = htonl(localAddress);
+            if (bind(discovery, reinterpret_cast<sockaddr*>(&local),
+                     sizeof(local)) == SOCKET_ERROR)
+            {
+                closesocket(discovery);
+                continue;
+            }
+
+            DiscoveryRequest request = {{'B', '2', 'D', 'Q'}, htons(1), 0};
+            sockaddr_in destination = {};
+            destination.sin_family = AF_INET;
+            destination.sin_port = htons(kDiscoveryPort);
+            destination.sin_addr.s_addr =
+                htonl((localAddress & 0xFFFFFF00u) | 0xFFu);
+            sockaddr_in board = {};
+            int boardLength = sizeof(board);
+            int received = SOCKET_ERROR;
+            for (int attempt = 0; attempt < 2 && received == SOCKET_ERROR;
+                 ++attempt)
+            {
+                sendto(discovery, reinterpret_cast<const char*>(&request),
+                       sizeof(request), 0,
+                       reinterpret_cast<sockaddr*>(&destination),
+                       sizeof(destination));
+                DiscoveryReply reply = {};
+                received = recvfrom(discovery, reinterpret_cast<char*>(&reply),
+                                    sizeof(reply), 0,
+                                    reinterpret_cast<sockaddr*>(&board),
+                                    &boardLength);
+                if (received == sizeof(reply) &&
+                    memcmp(reply.Magic, "B2DR", 4) == 0 &&
+                    ntohs(reply.Version) == 1 &&
+                    ntohs(reply.Width) == kLcdWidth &&
+                    ntohs(reply.Height) == kLcdHeight)
+                {
+                    board.sin_port = reply.StreamPort;
+                    closesocket(discovery);
+                    return ConnectToAddress(board, false, localAddress);
+                }
+                received = SOCKET_ERROR;
+                boardLength = sizeof(board);
+            }
+            closesocket(discovery);
+        }
+        return false;
+    }
+
+    bool RefreshStreamSession()
+    {
+        // Drain acknowledgements from earlier keepalives without blocking.
+        while (true)
+        {
+            fd_set readable;
+            FD_ZERO(&readable);
+            FD_SET(m_Socket, &readable);
+            timeval noWait = {0, 0};
+            if (select(0, &readable, nullptr, nullptr, &noWait) <= 0)
             {
                 break;
             }
+            StreamAck ack = {};
+            recv(m_Socket, reinterpret_cast<char*>(&ack), sizeof(ack), 0);
         }
-        return connected;
+
+        StreamHello hello = {{'B', '2', 'D', 'S'}, htons(4),
+                             htons(static_cast<uint16_t>(kLcdWidth)),
+                             htons(static_cast<uint16_t>(kLcdHeight)), htons(2)};
+        int sent = send(m_Socket, reinterpret_cast<const char*>(&hello),
+                        sizeof(hello), 0);
+        if (sent == sizeof(hello))
+        {
+            return true;
+        }
+        int error = WSAGetLastError();
+        return error == WSAEWOULDBLOCK || error == WSAETIMEDOUT;
     }
 
-    bool SendAll(const uint8_t* Data, size_t Size)
+    bool SendUdpFrame(const std::vector<uint8_t>& Jpeg, uint32_t Sequence)
     {
-        size_t sent = 0;
-        while (sent < Size)
+        if (Jpeg.empty() || Jpeg.size() > kMaxJpegBytes)
         {
-            int result = send(m_Socket,
-                              reinterpret_cast<const char*>(Data + sent),
-                              static_cast<int>(Size - sent), 0);
-            if (result <= 0)
+            return true;
+        }
+        const size_t fragmentCount =
+            (Jpeg.size() + kFragmentPayloadBytes - 1) /
+            kFragmentPayloadBytes;
+        for (size_t index = 0; index < fragmentCount; ++index)
+        {
+            const size_t offset = index * kFragmentPayloadBytes;
+            const size_t payloadBytes =
+                std::min(kFragmentPayloadBytes, Jpeg.size() - offset);
+            UdpFragmentHeader header = {
+                {'B', '2', 'U', '4'},
+                htonl(static_cast<uint32_t>(Jpeg.size())),
+                htonl(Sequence),
+                htons(static_cast<uint16_t>(index)),
+                htons(static_cast<uint16_t>(fragmentCount)),
+                htonl(static_cast<uint32_t>(offset)),
+                htons(static_cast<uint16_t>(payloadBytes)),
+                0,
+            };
+            WSABUF buffers[2] = {
+                {static_cast<ULONG>(sizeof(header)),
+                 reinterpret_cast<char*>(&header)},
+                {static_cast<ULONG>(payloadBytes),
+                 reinterpret_cast<char*>(
+                     const_cast<uint8_t*>(Jpeg.data() + offset))},
+            };
+            DWORD sentBytes = 0;
+            int result = WSASend(m_Socket, buffers, 2, &sentBytes, 0,
+                                 nullptr, nullptr);
+            if (result == SOCKET_ERROR)
             {
+                int error = WSAGetLastError();
+                if (error == WSAEWOULDBLOCK || error == WSAETIMEDOUT)
+                {
+                    ++m_CongestedFrames;
+                    return true;
+                }
                 return false;
             }
-            sent += static_cast<size_t>(result);
+            if (sentBytes != sizeof(header) + payloadBytes)
+            {
+                ++m_CongestedFrames;
+                return true;
+            }
         }
         return true;
     }
@@ -838,6 +920,8 @@ private:
     uint32_t m_PendingSequence = 0;
     uint32_t m_NextSequence = 0;
     uint64_t m_OverwrittenFrames = 0;
+    uint64_t m_CongestedFrames = 0;
+    ULONGLONG m_NextSessionRefresh = 0;
     SOCKET m_Socket = INVALID_SOCKET;
 };
 

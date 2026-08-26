@@ -23,7 +23,6 @@
 #include "hardware_test_screen.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
-#include "lwip/tcp.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -34,6 +33,11 @@
 #define STREAM_BUFFER_COUNT 3
 #define STREAM_FRAME_BYTES (STREAM_WIDTH * STREAM_HEIGHT * sizeof(uint16_t))
 #define STREAM_MAX_JPEG_BYTES STREAM_FRAME_BYTES
+#define STREAM_FRAGMENT_PAYLOAD_BYTES 1400
+#define STREAM_MAX_FRAGMENTS \
+    ((STREAM_MAX_JPEG_BYTES + STREAM_FRAGMENT_PAYLOAD_BYTES - 1) / \
+     STREAM_FRAGMENT_PAYLOAD_BYTES)
+#define STREAM_FRAGMENT_BITMAP_BYTES ((STREAM_MAX_FRAGMENTS + 7) / 8)
 #define LCD_FRAME_BYTES (BOX2_LCD_WIDTH * BOX2_LCD_HEIGHT * sizeof(uint16_t))
 
 #define WIFI_CONNECTED_BIT BIT0
@@ -91,11 +95,14 @@ typedef struct __attribute__((packed)) {
 
 typedef struct __attribute__((packed)) {
     char magic[4];
-    uint32_t payload_bytes;
+    uint32_t frame_bytes;
     uint32_t sequence;
-    uint16_t width;
-    uint16_t height;
-} jpeg_frame_header_t;
+    uint16_t fragment_index;
+    uint16_t fragment_count;
+    uint32_t fragment_offset;
+    uint16_t payload_bytes;
+    uint16_t reserved;
+} udp_fragment_header_t;
 
 static void trim_line(char *line)
 {
@@ -314,28 +321,6 @@ static esp_err_t initialize_frame_buffers(void)
     return ESP_OK;
 }
 
-static bool receive_exact(int socket_fd, uint8_t *destination, size_t size,
-                          bool count_payload)
-{
-    size_t received = 0;
-    while (received < size) {
-        int result = recv(socket_fd, destination + received,
-                          size - received, 0);
-        if (result > 0) {
-            received += (size_t)result;
-            if (count_payload) {
-                s_received_bytes += (uint64_t)result;
-            }
-            continue;
-        }
-        if (result < 0 && errno == EINTR) {
-            continue;
-        }
-        return false;
-    }
-    return true;
-}
-
 static uint8_t acquire_receive_buffer(void)
 {
     uint8_t index;
@@ -447,114 +432,171 @@ static void stream_server_task(void *argument)
 {
     (void)argument;
     while (true) {
-        int listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
-        if (listen_fd < 0) {
-            ESP_LOGE(TAG, "socket failed: errno=%d", errno);
+        int socket_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (socket_fd < 0) {
+            ESP_LOGE(TAG, "UDP stream socket failed: errno=%d", errno);
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
 
         int reuse = 1;
-        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        int receive_buffer_size = STREAM_FRAME_BYTES * 2;
+        setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        setsockopt(socket_fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer_size,
+                   sizeof(receive_buffer_size));
         struct sockaddr_in address = {
             .sin_family = AF_INET,
             .sin_port = htons(STREAM_PORT),
             .sin_addr.s_addr = htonl(INADDR_ANY),
         };
-        if (bind(listen_fd, (struct sockaddr *)&address, sizeof(address)) != 0 ||
-            listen(listen_fd, 1) != 0) {
-            ESP_LOGE(TAG, "bind/listen failed: errno=%d", errno);
-            close(listen_fd);
+        if (bind(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0) {
+            ESP_LOGE(TAG, "UDP stream bind failed: errno=%d", errno);
+            close(socket_fd);
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
 
-        ESP_LOGI(TAG, "MJPEG TCP server ready on port %d", STREAM_PORT);
-        printf("BOX2_TCP_READY=%d\n", STREAM_PORT);
+        ESP_LOGI(TAG, "MJPEG UDP server ready on port %d", STREAM_PORT);
+        printf("BOX2_UDP_READY=%d\n", STREAM_PORT);
         fflush(stdout);
 
-        struct sockaddr_in peer;
-        socklen_t peer_length = sizeof(peer);
-        int client_fd = accept(listen_fd, (struct sockaddr *)&peer, &peer_length);
-        close(listen_fd);
-        if (client_fd < 0) {
-            ESP_LOGW(TAG, "accept failed: errno=%d", errno);
-            continue;
-        }
-
-        int no_delay = 1;
-        int receive_buffer_size = STREAM_FRAME_BYTES * 2;
-        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &no_delay,
-                   sizeof(no_delay));
-        setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &receive_buffer_size,
-                   sizeof(receive_buffer_size));
-        ESP_LOGI(TAG, "Stream client connected from %s", inet_ntoa(peer.sin_addr));
-
-        struct timeval handshake_timeout = {.tv_sec = 2, .tv_usec = 0};
-        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &handshake_timeout,
-                   sizeof(handshake_timeout));
-        stream_hello_t hello;
-        bool valid_hello = receive_exact(client_fd, (uint8_t *)&hello,
-                                         sizeof(hello), false) &&
-                           memcmp(hello.magic, "B2DS", 4) == 0 &&
-                           ntohs(hello.version) == 3 &&
-                           ntohs(hello.width) == STREAM_WIDTH &&
-                           ntohs(hello.height) == STREAM_HEIGHT &&
-                           ntohs(hello.pixel_format) == 2;
-        if (!valid_hello) {
-            ESP_LOGW(TAG, "Rejected client without valid BOX-2 handshake");
-            shutdown(client_fd, SHUT_RDWR);
-            close(client_fd);
-            continue;
-        }
-
-        stream_ack_t ack = {
-            .magic = {'B', '2', 'D', 'A'},
-            .version = htons(3),
-            .status = htons(0),
-        };
-        if (send(client_fd, &ack, sizeof(ack), 0) != sizeof(ack)) {
-            shutdown(client_fd, SHUT_RDWR);
-            close(client_fd);
-            continue;
-        }
-        struct timeval no_timeout = {.tv_sec = 0, .tv_usec = 0};
-        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &no_timeout,
-                   sizeof(no_timeout));
-        ESP_LOGI(TAG, "BOX-2 stream handshake accepted");
+        uint8_t datagram[sizeof(udp_fragment_header_t) +
+                         STREAM_FRAGMENT_PAYLOAD_BYTES];
+        uint8_t fragment_bitmap[STREAM_FRAGMENT_BITMAP_BYTES] = {0};
+        struct sockaddr_in active_peer = {0};
+        bool have_peer = false;
+        bool have_sequence = false;
+        bool frame_in_progress = false;
+        uint32_t current_sequence = 0;
+        uint32_t current_frame_bytes = 0;
+        uint16_t current_fragment_count = 0;
+        uint16_t received_fragments = 0;
 
         while (true) {
-            jpeg_frame_header_t header;
-            if (!receive_exact(client_fd, (uint8_t *)&header,
-                               sizeof(header), false)) {
-                break;
+            struct sockaddr_in peer = {0};
+            socklen_t peer_length = sizeof(peer);
+            int received = recvfrom(socket_fd, datagram, sizeof(datagram), 0,
+                                    (struct sockaddr *)&peer, &peer_length);
+            if (received < 0 && errno == EINTR) {
+                continue;
             }
-            uint32_t payload_bytes = ntohl(header.payload_bytes);
-            uint16_t width = ntohs(header.width);
-            uint16_t height = ntohs(header.height);
-            bool valid_update = memcmp(header.magic, "B2J3", 4) == 0 &&
-                                width == STREAM_WIDTH &&
-                                height == STREAM_HEIGHT &&
-                                payload_bytes > 0 &&
-                                payload_bytes <= STREAM_MAX_JPEG_BYTES;
-            if (!valid_update) {
-                ESP_LOGW(TAG, "Rejected invalid MJPEG frame header");
+            if (received < 0) {
+                ESP_LOGW(TAG, "UDP stream receive failed: errno=%d", errno);
                 break;
             }
 
-            if (!receive_exact(client_fd, s_jpeg_buffer,
-                               payload_bytes, true)) {
-                break;
+            if (received == sizeof(stream_hello_t)) {
+                const stream_hello_t *hello = (const stream_hello_t *)datagram;
+                if (memcmp(hello->magic, "B2DS", 4) == 0 &&
+                    ntohs(hello->version) == 4 &&
+                    ntohs(hello->width) == STREAM_WIDTH &&
+                    ntohs(hello->height) == STREAM_HEIGHT &&
+                    ntohs(hello->pixel_format) == 2) {
+                    bool new_peer = !have_peer ||
+                        peer.sin_addr.s_addr != active_peer.sin_addr.s_addr ||
+                        peer.sin_port != active_peer.sin_port;
+                    active_peer = peer;
+                    have_peer = true;
+                    if (new_peer) {
+                        have_sequence = false;
+                        frame_in_progress = false;
+                    }
+                    stream_ack_t ack = {
+                        .magic = {'B', '2', 'D', 'A'},
+                        .version = htons(4),
+                        .status = htons(0),
+                    };
+                    sendto(socket_fd, &ack, sizeof(ack), 0,
+                           (struct sockaddr *)&peer, peer_length);
+                    if (new_peer) {
+                        ESP_LOGI(TAG, "UDP stream client accepted from %s:%u",
+                                 inet_ntoa(peer.sin_addr),
+                                 ntohs(peer.sin_port));
+                    }
+                }
+                continue;
             }
+
+            if (!have_peer || peer.sin_addr.s_addr != active_peer.sin_addr.s_addr ||
+                peer.sin_port != active_peer.sin_port ||
+                received < (int)sizeof(udp_fragment_header_t)) {
+                continue;
+            }
+
+            const udp_fragment_header_t *header =
+                (const udp_fragment_header_t *)datagram;
+            uint32_t frame_bytes = ntohl(header->frame_bytes);
+            uint32_t sequence = ntohl(header->sequence);
+            uint16_t fragment_index = ntohs(header->fragment_index);
+            uint16_t fragment_count = ntohs(header->fragment_count);
+            uint32_t fragment_offset = ntohl(header->fragment_offset);
+            uint16_t payload_bytes = ntohs(header->payload_bytes);
+            uint16_t expected_count = (uint16_t)(
+                (frame_bytes + STREAM_FRAGMENT_PAYLOAD_BYTES - 1) /
+                STREAM_FRAGMENT_PAYLOAD_BYTES);
+            uint32_t remaining_bytes = fragment_offset < frame_bytes
+                ? frame_bytes - fragment_offset : 0;
+            uint16_t expected_payload = (uint16_t)(
+                remaining_bytes > STREAM_FRAGMENT_PAYLOAD_BYTES
+                    ? STREAM_FRAGMENT_PAYLOAD_BYTES : remaining_bytes);
+            bool valid_fragment = memcmp(header->magic, "B2U4", 4) == 0 &&
+                frame_bytes > 0 && frame_bytes <= STREAM_MAX_JPEG_BYTES &&
+                fragment_count > 0 && fragment_count <= STREAM_MAX_FRAGMENTS &&
+                fragment_count == expected_count &&
+                fragment_index < fragment_count &&
+                fragment_offset ==
+                    (uint32_t)fragment_index * STREAM_FRAGMENT_PAYLOAD_BYTES &&
+                fragment_offset < frame_bytes &&
+                payload_bytes == expected_payload &&
+                received == (int)(sizeof(*header) + payload_bytes);
+            if (!valid_fragment) {
+                continue;
+            }
+
+            if (!have_sequence || (int32_t)(sequence - current_sequence) > 0) {
+                if (frame_in_progress) {
+                    ++s_dropped_frames;
+                }
+                current_sequence = sequence;
+                current_frame_bytes = frame_bytes;
+                current_fragment_count = fragment_count;
+                received_fragments = 0;
+                memset(fragment_bitmap, 0, sizeof(fragment_bitmap));
+                have_sequence = true;
+                frame_in_progress = true;
+            } else if ((int32_t)(sequence - current_sequence) < 0 ||
+                       !frame_in_progress) {
+                continue;
+            }
+
+            if (frame_bytes != current_frame_bytes ||
+                fragment_count != current_fragment_count) {
+                continue;
+            }
+            uint8_t mask = (uint8_t)(1U << (fragment_index & 7));
+            uint8_t *bitmap_byte = &fragment_bitmap[fragment_index >> 3];
+            if ((*bitmap_byte & mask) != 0) {
+                continue;
+            }
+            memcpy(s_jpeg_buffer + fragment_offset,
+                   datagram + sizeof(*header), payload_bytes);
+            *bitmap_byte |= mask;
+            ++received_fragments;
+            s_received_bytes += payload_bytes;
+
+            if (received_fragments != current_fragment_count) {
+                continue;
+            }
+            frame_in_progress = false;
             uint8_t index = acquire_receive_buffer();
             int64_t decode_start = esp_timer_get_time();
-            bool decoded = decode_jpeg_frame(payload_bytes,
+            bool decoded = decode_jpeg_frame(current_frame_bytes,
                                              s_frame_buffers[index]);
             s_decode_time_us +=
                 (uint64_t)(esp_timer_get_time() - decode_start);
             ++s_received_frames;
             if (!decoded) {
-                ESP_LOGW(TAG, "Rejected invalid MJPEG payload");
+                ESP_LOGW(TAG, "Rejected invalid reassembled MJPEG frame");
                 ++s_dropped_frames;
                 xQueueSend(s_free_buffers, &index, portMAX_DELAY);
                 continue;
@@ -562,9 +604,8 @@ static void stream_server_task(void *argument)
             queue_completed_frame(index);
         }
 
-        ESP_LOGI(TAG, "Stream client disconnected");
-        shutdown(client_fd, SHUT_RDWR);
-        close(client_fd);
+        close(socket_fd);
+        vTaskDelay(pdMS_TO_TICKS(250));
     }
 }
 
@@ -628,7 +669,7 @@ static void show_waiting_screen(void)
     const char *lines[] = {
         "MODE WINDOWS EXT DISPLAY",
         "FRAME 320X240 MJPEG",
-        "TCP VIDEO PORT 5000",
+        "UDP VIDEO PORT 5000",
         "AUTO DISCOVERY UDP 5001",
         "JPEG QUALITY 80",
     };
@@ -673,7 +714,7 @@ void app_main(void)
     BaseType_t stats_created = xTaskCreate(
         statistics_task, "rgb_stats", 4096, NULL, 5, NULL);
     BaseType_t server_created = xTaskCreatePinnedToCore(
-        stream_server_task, "mjpeg_server", 8192, NULL, 10, NULL, 0);
+        stream_server_task, "mjpeg_udp", 8192, NULL, 10, NULL, 0);
     BaseType_t discovery_created = xTaskCreate(
         discovery_task, "rgb_discovery", 4096, NULL, 6, NULL);
     ESP_ERROR_CHECK(display_created == pdPASS && stats_created == pdPASS &&

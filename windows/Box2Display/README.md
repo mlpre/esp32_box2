@@ -9,9 +9,10 @@ is exposed. The host also draws an enlarged native cursor into the transmitted
 image before encoding.
 
 USB serial is used only for firmware flashing and diagnostics. Display pixels
-travel over TCP port 5000. The host first broadcasts a discovery request on UDP
-port 5001 and falls back to probing the PC's local `/24` networks. A versioned
-`B2DS`/`B2DA` handshake prevents connecting to an unrelated TCP service.
+travel over UDP port 5000. The host first broadcasts a discovery request on UDP
+port 5001 and falls back to directed broadcasts on the PC's local `/24`
+networks. A versioned `B2DS`/`B2DA` datagram handshake prevents sending video
+to an unrelated UDP service.
 
 ## Build and install
 
@@ -45,15 +46,21 @@ To remove the display, driver, firewall rule, and logon task:
 
 ## Transport
 
-Protocol version 3 carries one complete baseline JPEG image per TCP frame. UDP
-port 5001 remains responsible for discovery, while the ordered MJPEG byte stream
-uses TCP port 5000. Every JPEG header includes its encoded size, sequence number,
-and fixed `320 x 240` dimensions.
+Protocol version 4 splits each baseline JPEG image into UDP datagrams on port
+5000. Each datagram stays below the normal Ethernet MTU: a 24-byte header and
+at most 1400 JPEG bytes. Its header carries the frame size and sequence plus the
+fragment index, count, offset, and payload length. UDP port 5001 remains
+responsible for discovery.
 
 The host captures and encodes at up to 30 FPS. The ESP32 decodes each JPEG
 directly to RGB565 little-endian in an aligned PSRAM buffer, keeps only the
 latest completed frame waiting for the LCD, and drops stale completed frames
 instead of accumulating display latency. The Windows host reuses its GDI
-capture surface and JPEG memory stream, and runs TCP transmission on a separate
-thread backed by a single latest-frame slot. Network stalls can therefore
-replace an old unsent frame without blocking capture or building a backlog.
+capture surface and JPEG memory stream, and runs UDP transmission on a separate
+thread backed by a single latest-frame slot. The ESP32 decodes only fully
+reassembled JPEG frames. If any fragment is missing, that frame is discarded as
+soon as a newer sequence arrives, so packet loss produces a skipped frame rather
+than partial-image artifacts or retransmission latency. A one-second session
+keepalive lets streaming recover automatically after an ESP32 reboot or a brief
+Wi-Fi interruption, without waiting for a UDP disconnect event that does not
+exist.
