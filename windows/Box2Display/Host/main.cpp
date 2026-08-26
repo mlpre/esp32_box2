@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <iphlpapi.h>
 #include <swdevice.h>
+#include <wincodec.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -19,8 +20,7 @@ constexpr DWORD kSourceWidth = 480;
 constexpr DWORD kSourceHeight = 360;
 constexpr unsigned int kLcdWidth = 320;
 constexpr unsigned int kLcdHeight = 240;
-constexpr size_t kFrameBytes = kLcdWidth * kLcdHeight * sizeof(uint16_t);
-constexpr uint32_t kPayloadRleFlag = 0x80000000u;
+constexpr float kJpegQuality = 0.80f;
 bool g_Verbose = false;
 
 bool EnsureLandscapeMode()
@@ -103,15 +103,13 @@ struct StreamAck
     uint16_t Status;
 };
 
-struct FrameUpdateHeader
+struct JpegFrameHeader
 {
     char Magic[4];
-    uint16_t X;
-    uint16_t Y;
-    uint16_t Width;
-    uint16_t Height;
     uint32_t PayloadBytes;
     uint32_t Sequence;
+    uint16_t Width;
+    uint16_t Height;
 };
 #pragma pack(pop)
 
@@ -122,11 +120,28 @@ public:
     {
         WSADATA data = {};
         m_WinsockReady = WSAStartup(MAKEWORD(2, 2), &data) == 0;
+        HRESULT result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        m_ComInitialized = result == S_OK || result == S_FALSE;
+        result = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
+                                  CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&m_WicFactory));
+        if (FAILED(result))
+        {
+            m_WicFactory = nullptr;
+        }
     }
 
     ~DisplayStreamer()
     {
         CloseSocket();
+        if (m_WicFactory)
+        {
+            m_WicFactory->Release();
+        }
+        if (m_ComInitialized)
+        {
+            CoUninitialize();
+        }
         if (m_WinsockReady)
         {
             WSACleanup();
@@ -143,7 +158,7 @@ public:
             return false;
         }
 
-        std::vector<uint8_t> bgra(kLcdWidth * kLcdHeight * 4);
+        std::vector<uint8_t> bgr(kLcdWidth * kLcdHeight * 3);
         HDC desktop = GetDC(nullptr);
         HDC memory = CreateCompatibleDC(desktop);
         BITMAPINFO info = {};
@@ -151,7 +166,7 @@ public:
         info.bmiHeader.biWidth = static_cast<LONG>(kLcdWidth);
         info.bmiHeader.biHeight = -static_cast<LONG>(kLcdHeight);
         info.bmiHeader.biPlanes = 1;
-        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biBitCount = 24;
         info.bmiHeader.biCompression = BI_RGB;
         void* pixels = nullptr;
         HBITMAP bitmap = CreateDIBSection(memory, &info, DIB_RGB_COLORS,
@@ -174,7 +189,7 @@ public:
         if (captured)
         {
             DrawCursor(memory, mode);
-            memcpy(bgra.data(), pixels, bgra.size());
+            memcpy(bgr.data(), pixels, bgr.size());
         }
         SelectObject(memory, previous);
         DeleteObject(bitmap);
@@ -185,17 +200,10 @@ public:
             return false;
         }
 
-        std::vector<uint8_t> frame(kFrameBytes);
-        for (size_t index = 0; index < kLcdWidth * kLcdHeight; ++index)
+        std::vector<uint8_t> jpeg;
+        if (!EncodeJpeg(bgr, jpeg))
         {
-            const uint8_t blue = bgra[index * 4];
-            const uint8_t green = bgra[index * 4 + 1];
-            const uint8_t red = bgra[index * 4 + 2];
-            const uint16_t rgb565 = static_cast<uint16_t>(((red & 0xF8) << 8) |
-                                                          ((green & 0xFC) << 3) |
-                                                          (blue >> 3));
-            frame[index * 2] = static_cast<uint8_t>(rgb565);
-            frame[index * 2 + 1] = static_cast<uint8_t>(rgb565 >> 8);
+            return false;
         }
 
         if (m_Socket == INVALID_SOCKET && !DiscoverAndConnect())
@@ -203,138 +211,107 @@ public:
             return false;
         }
 
-        unsigned int minX = 0;
-        unsigned int minY = 0;
-        unsigned int maxX = kLcdWidth - 1;
-        unsigned int maxY = kLcdHeight - 1;
-        if (!m_NeedsKeyFrame && m_PreviousFrame.size() == frame.size())
-        {
-            minX = kLcdWidth;
-            minY = kLcdHeight;
-            maxX = 0;
-            maxY = 0;
-            for (unsigned int y = 0; y < kLcdHeight; ++y)
-            {
-                for (unsigned int x = 0; x < kLcdWidth; ++x)
-                {
-                    size_t offset = (static_cast<size_t>(y) * kLcdWidth + x) * 2;
-                    if (frame[offset] == m_PreviousFrame[offset] &&
-                        frame[offset + 1] == m_PreviousFrame[offset + 1])
-                    {
-                        continue;
-                    }
-                    minX = (std::min)(minX, x);
-                    minY = (std::min)(minY, y);
-                    maxX = (std::max)(maxX, x);
-                    maxY = (std::max)(maxY, y);
-                }
-            }
-            if (minX == kLcdWidth)
-            {
-                return true;
-            }
-
-            // Include a small border for antialiased text and cursor edges.
-            minX = minX > 2 ? minX - 2 : 0;
-            minY = minY > 2 ? minY - 2 : 0;
-            maxX = (std::min)(maxX + 2, kLcdWidth - 1);
-            maxY = (std::min)(maxY + 2, kLcdHeight - 1);
-        }
-
-        const unsigned int width = maxX - minX + 1;
-        const unsigned int height = maxY - minY + 1;
-        std::vector<uint8_t> update(static_cast<size_t>(width) * height * 2);
-        for (unsigned int row = 0; row < height; ++row)
-        {
-            const size_t sourceOffset =
-                (static_cast<size_t>(minY + row) * kLcdWidth + minX) * 2;
-            memcpy(update.data() + static_cast<size_t>(row) * width * 2,
-                   frame.data() + sourceOffset, static_cast<size_t>(width) * 2);
-        }
-
-        std::vector<uint8_t> encoded = EncodeRgb565Rle(update);
-        const bool useRle = encoded.size() < update.size();
-        const std::vector<uint8_t>& payload = useRle ? encoded : update;
-        const uint32_t payloadField = static_cast<uint32_t>(payload.size()) |
-                                      (useRle ? kPayloadRleFlag : 0u);
-
-        FrameUpdateHeader header = {
-            {'B', '2', 'F', '2'},
-            htons(static_cast<uint16_t>(minX)),
-            htons(static_cast<uint16_t>(minY)),
-            htons(static_cast<uint16_t>(width)),
-            htons(static_cast<uint16_t>(height)),
-            htonl(payloadField),
+        JpegFrameHeader header = {
+            {'B', '2', 'J', '3'},
+            htonl(static_cast<uint32_t>(jpeg.size())),
             htonl(m_Sequence++),
+            htons(static_cast<uint16_t>(kLcdWidth)),
+            htons(static_cast<uint16_t>(kLcdHeight)),
         };
         if (!SendAll(reinterpret_cast<const uint8_t*>(&header), sizeof(header)) ||
-            !SendAll(payload.data(), payload.size()))
+            !SendAll(jpeg.data(), jpeg.size()))
         {
             CloseSocket();
             return false;
         }
-        m_PreviousFrame = std::move(frame);
-        m_NeedsKeyFrame = false;
         return true;
     }
 
 private:
-    static std::vector<uint8_t> EncodeRgb565Rle(
-        const std::vector<uint8_t>& Pixels)
+    bool EncodeJpeg(const std::vector<uint8_t>& Pixels,
+                    std::vector<uint8_t>& Encoded) const
     {
-        const size_t pixelCount = Pixels.size() / 2;
-        std::vector<uint8_t> encoded;
-        encoded.reserve(Pixels.size());
-        auto samePixel = [&Pixels](size_t left, size_t right)
+        if (!m_WicFactory)
         {
-            return Pixels[left * 2] == Pixels[right * 2] &&
-                   Pixels[left * 2 + 1] == Pixels[right * 2 + 1];
-        };
-
-        size_t position = 0;
-        while (position < pixelCount)
-        {
-            size_t runLength = 1;
-            while (position + runLength < pixelCount && runLength < 128 &&
-                   samePixel(position, position + runLength))
-            {
-                ++runLength;
-            }
-            if (runLength >= 3)
-            {
-                encoded.push_back(static_cast<uint8_t>(0x80 | (runLength - 1)));
-                encoded.push_back(Pixels[position * 2]);
-                encoded.push_back(Pixels[position * 2 + 1]);
-                position += runLength;
-                continue;
-            }
-
-            const size_t literalStart = position;
-            size_t literalLength = 0;
-            while (position < pixelCount && literalLength < 128)
-            {
-                runLength = 1;
-                while (position + runLength < pixelCount && runLength < 128 &&
-                       samePixel(position, position + runLength))
-                {
-                    ++runLength;
-                }
-                if (runLength >= 3)
-                {
-                    break;
-                }
-                ++position;
-                ++literalLength;
-            }
-            encoded.push_back(static_cast<uint8_t>(literalLength - 1));
-            using Difference = std::vector<uint8_t>::difference_type;
-            encoded.insert(
-                encoded.end(),
-                Pixels.begin() + static_cast<Difference>(literalStart * 2),
-                Pixels.begin() +
-                    static_cast<Difference>((literalStart + literalLength) * 2));
+            return false;
         }
-        return encoded;
+
+        IStream* stream = nullptr;
+        IWICBitmapEncoder* encoder = nullptr;
+        IWICBitmapFrameEncode* frame = nullptr;
+        IPropertyBag2* properties = nullptr;
+        HRESULT result = CreateStreamOnHGlobal(nullptr, TRUE, &stream);
+        if (SUCCEEDED(result))
+        {
+            result = m_WicFactory->CreateEncoder(GUID_ContainerFormatJpeg,
+                                                 nullptr, &encoder);
+        }
+        if (SUCCEEDED(result))
+        {
+            result = encoder->Initialize(stream, WICBitmapEncoderNoCache);
+        }
+        if (SUCCEEDED(result))
+        {
+            result = encoder->CreateNewFrame(&frame, &properties);
+        }
+        if (SUCCEEDED(result) && properties)
+        {
+            PROPBAG2 option = {};
+            option.pstrName = const_cast<wchar_t*>(L"ImageQuality");
+            VARIANT value;
+            VariantInit(&value);
+            value.vt = VT_R4;
+            value.fltVal = kJpegQuality;
+            result = properties->Write(1, &option, &value);
+            VariantClear(&value);
+        }
+        if (SUCCEEDED(result)) result = frame->Initialize(properties);
+        if (SUCCEEDED(result)) result = frame->SetSize(kLcdWidth, kLcdHeight);
+        WICPixelFormatGUID format = GUID_WICPixelFormat24bppBGR;
+        if (SUCCEEDED(result)) result = frame->SetPixelFormat(&format);
+        if (SUCCEEDED(result) && format != GUID_WICPixelFormat24bppBGR)
+        {
+            result = E_FAIL;
+        }
+        if (SUCCEEDED(result))
+        {
+            result = frame->WritePixels(
+                kLcdHeight, kLcdWidth * 3,
+                static_cast<UINT>(Pixels.size()),
+                const_cast<BYTE*>(Pixels.data()));
+        }
+        if (SUCCEEDED(result)) result = frame->Commit();
+        if (SUCCEEDED(result)) result = encoder->Commit();
+
+        HGLOBAL memory = nullptr;
+        STATSTG statistics = {};
+        if (SUCCEEDED(result)) result = GetHGlobalFromStream(stream, &memory);
+        if (SUCCEEDED(result)) result = stream->Stat(&statistics, STATFLAG_NONAME);
+        if (SUCCEEDED(result) && statistics.cbSize.HighPart == 0)
+        {
+            const size_t size = statistics.cbSize.LowPart;
+            const void* data = GlobalLock(memory);
+            if (data && size > 0 && size <= UINT32_MAX)
+            {
+                const auto first = static_cast<const uint8_t*>(data);
+                Encoded.assign(first, first + size);
+            }
+            else
+            {
+                result = E_FAIL;
+            }
+            if (data) GlobalUnlock(memory);
+        }
+        else if (SUCCEEDED(result))
+        {
+            result = E_FAIL;
+        }
+
+        if (properties) properties->Release();
+        if (frame) frame->Release();
+        if (encoder) encoder->Release();
+        if (stream) stream->Release();
+        return SUCCEEDED(result) && !Encoded.empty();
     }
 
     static void DrawCursor(HDC Target, const DEVMODE& Mode)
@@ -544,9 +521,9 @@ private:
         setsockopt(stream, SOL_SOCKET, SO_RCVTIMEO,
                    reinterpret_cast<const char*>(&receiveTimeout), sizeof(receiveTimeout));
 
-        StreamHello hello = {{'B', '2', 'D', 'S'}, htons(2),
+        StreamHello hello = {{'B', '2', 'D', 'S'}, htons(3),
                              htons(static_cast<uint16_t>(kLcdWidth)),
-                             htons(static_cast<uint16_t>(kLcdHeight)), htons(1)};
+                             htons(static_cast<uint16_t>(kLcdHeight)), htons(2)};
         size_t helloSent = 0;
         while (helloSent < sizeof(hello))
         {
@@ -573,15 +550,14 @@ private:
             }
             ackReceived += static_cast<size_t>(result);
         }
-        if (memcmp(ack.Magic, "B2DA", 4) != 0 || ntohs(ack.Version) != 2 ||
+        if (memcmp(ack.Magic, "B2DA", 4) != 0 || ntohs(ack.Version) != 3 ||
             ntohs(ack.Status) != 0)
         {
             closesocket(stream);
             return false;
         }
         m_Socket = stream;
-        m_NeedsKeyFrame = true;
-        if (g_Verbose) fwprintf(stderr, L"Connected to BOX-2 stream.\n");
+        if (g_Verbose) fwprintf(stderr, L"Connected to BOX-2 MJPEG stream.\n");
         return true;
     }
 
@@ -698,14 +674,13 @@ private:
             closesocket(m_Socket);
             m_Socket = INVALID_SOCKET;
         }
-        m_NeedsKeyFrame = true;
     }
 
     bool m_WinsockReady = false;
+    bool m_ComInitialized = false;
+    IWICImagingFactory* m_WicFactory = nullptr;
     SOCKET m_Socket = INVALID_SOCKET;
-    bool m_NeedsKeyFrame = true;
     uint32_t m_Sequence = 0;
-    std::vector<uint8_t> m_PreviousFrame;
 };
 
 struct CreationContext

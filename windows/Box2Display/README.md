@@ -3,10 +3,10 @@
 This project turns the BOX-2 LCD into a Windows 11 extended display. The
 indirect display driver exposes one landscape `480 x 360 @ 30 Hz` monitor. The
 elevated host process captures that monitor, scales it to the LCD's native
-`320 x 240` resolution using high-quality downscaling, converts BGRA8 to
-RGB565 little-endian, and streams it over Wi-Fi. Only landscape mode is
-exposed. The host also draws an enlarged native cursor into the transmitted
-image.
+`320 x 240` resolution using high-quality downscaling, encodes every frame as
+JPEG quality 80, and streams the MJPEG frames over Wi-Fi. Only landscape mode
+is exposed. The host also draws an enlarged native cursor into the transmitted
+image before encoding.
 
 USB serial is used only for firmware flashing and diagnostics. Display pixels
 travel over TCP port 5000. The host first broadcasts a discovery request on UDP
@@ -45,15 +45,12 @@ To remove the display, driver, firewall rule, and logon task:
 
 ## Transport
 
-Protocol version 2 starts with a full `320 * 240 * RGB565LE` key frame. Later
-updates contain only the changed bounding rectangle. An unchanged desktop sends
-no pixel payload, while ordinary cursor movement usually refreshes only a small
-region. Large animation or scrolling automatically falls back to a full-screen
-rectangle. Each rectangle uses lossless RGB565 run-length encoding when that is
-smaller than its raw pixels, and automatically falls back to raw RGB565 for
-photos or video.
+Protocol version 3 carries one complete baseline JPEG image per TCP frame. UDP
+port 5001 remains responsible for discovery, while the ordered MJPEG byte stream
+uses TCP port 5000. Every JPEG header includes its encoded size, sequence number,
+and fixed `320 x 240` dimensions.
 
-The host captures at up to 30 FPS. The ESP32 uses three PSRAM update buffers and
-applies every rectangle in order, preventing partial updates from being lost.
-This reduces typical bandwidth and LCD writes by an order of magnitude compared
-with continuously sending 153600-byte full frames.
+The host captures and encodes at up to 30 FPS. The ESP32 decodes each JPEG
+directly to RGB565 little-endian in an aligned PSRAM buffer, keeps only the
+latest completed frame waiting for the LCD, and drops stale completed frames
+instead of accumulating display latency.
