@@ -112,7 +112,7 @@ static void make_action_icon(lv_obj_t *screen, int x, const char *symbol)
     lv_obj_t *icon = lv_label_create(screen);
     lv_obj_set_pos(icon, x, 282);
     lv_obj_set_size(icon, 40, 30);
-    lv_obj_set_style_text_font(icon, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_16, LV_PART_MAIN);
     lv_obj_set_style_text_align(icon, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_style_text_color(icon, lv_color_hex(0xC7D2DE), LV_PART_MAIN);
     lv_label_set_text(icon, symbol);
