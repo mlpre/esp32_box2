@@ -26,3 +26,4 @@ i2c_master_bus_handle_t box2_board_i2c_bus(void);
 int box2_board_i2c_device_count(void);
 esp_err_t box2_board_i2c_scan(uint8_t *addresses, size_t capacity, size_t *count);
 esp_err_t box2_board_read_state(box2_board_state_t *state, bool sample_battery);
+esp_err_t box2_board_power_off(void);

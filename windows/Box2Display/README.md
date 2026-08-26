@@ -64,3 +64,11 @@ than partial-image artifacts or retransmission latency. A one-second session
 keepalive lets streaming recover automatically after an ESP32 reboot or a brief
 Wi-Fi interruption, without waiting for a UDP disconnect event that does not
 exist.
+
+## Power button
+
+Hold the middle **M** key for 1.5 seconds. On battery power this turns off the
+LCD and releases the board's `SYS_POW` latch for a real hardware shutdown. Hold
+the same key to power the board on again. USB supplies the board independently,
+so while USB is attached the same long press enters display standby instead;
+press **M** once to wake the display and resume decoding the newest frame.

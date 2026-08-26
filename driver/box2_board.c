@@ -167,7 +167,6 @@ esp_err_t box2_board_init(void)
     ESP_RETURN_ON_ERROR(gpio_config(&key_cfg), TAG, "configure keys");
     int l_high = 0;
     int q_high = 0;
-    int m_high = 0;
     int r_high = 0;
     for (int i = 0; i < 16; ++i)
     {
@@ -176,13 +175,15 @@ esp_err_t box2_board_init(void)
                             "calibrate key idle levels");
         l_high += (keys & BOX2_XIO_KEY_L) != 0;
         q_high += (keys & BOX2_XIO_KEY_Q) != 0;
-        m_high += (keys & BOX2_XIO_KEY_M) != 0;
         r_high += gpio_get_level(BOX2_BUTTON_RIGHT) != 0;
         vTaskDelay(pdMS_TO_TICKS(5));
     }
     s_key_l_idle = l_high >= 8;
     s_key_q_idle = q_high >= 8;
-    s_key_m_idle = m_high >= 8;
+    // The middle key is also the hardware power-on key and may still be held
+    // while firmware starts. Its electrical idle level is fixed low; do not
+    // calibrate a held power-on press as the idle state.
+    s_key_m_idle = false;
     s_key_r_idle = r_high >= 8;
     ESP_LOGI(TAG, "key idle levels: L(P5)=%d Q(P6)=%d M(P7)=%d R(GPIO0)=%d",
              s_key_l_idle, s_key_q_idle, s_key_m_idle, s_key_r_idle);
@@ -254,5 +255,32 @@ esp_err_t box2_board_read_state(box2_board_state_t *state, bool sample_battery)
         state->battery_percent = battery_percent_from_raw(raw);
         state->battery_mv_estimate = battery_mv_from_raw(raw);
     }
+    return ESP_OK;
+}
+
+esp_err_t box2_board_power_off(void)
+{
+    ESP_RETURN_ON_FALSE(s_tca9555, ESP_ERR_INVALID_STATE, TAG,
+                        "board is not initialized");
+
+    // Match the board's hardware shutdown sequence: momentarily drive the
+    // charge-control line low, then release the SYS_POW latch. With USB power
+    // attached the external supply remains present, so callers should only use
+    // this path after confirming battery operation.
+    ESP_RETURN_ON_ERROR(tca_write_u16(TCA9555_REG_CONFIG0,
+                                      BOX2_XIO_INPUT_MASK &
+                                          ~BOX2_XIO_CHG_CTRL),
+                        TAG, "enable shutdown charge control");
+    ESP_RETURN_ON_ERROR(tca_write_u16(TCA9555_REG_OUTPUT0,
+                                      BOX2_XIO_SAFE_OUTPUTS &
+                                          ~BOX2_XIO_CHG_CTRL),
+                        TAG, "drive shutdown charge control");
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_RETURN_ON_ERROR(tca_write_u16(TCA9555_REG_OUTPUT0,
+                                      BOX2_XIO_SAFE_OUTPUTS &
+                                          ~BOX2_XIO_CHG_CTRL &
+                                          ~BOX2_XIO_SYS_POW),
+                        TAG, "release system power latch");
+    vTaskDelay(pdMS_TO_TICKS(100));
     return ESP_OK;
 }

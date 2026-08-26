@@ -232,6 +232,13 @@ esp_err_t box2_lcd_set_backlight(uint8_t percent)
     return ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
+esp_err_t box2_lcd_set_power(bool enabled)
+{
+    ESP_RETURN_ON_FALSE(s_panel, ESP_ERR_INVALID_STATE, TAG,
+                        "LCD is not initialized");
+    return esp_lcd_panel_disp_on_off(s_panel, enabled);
+}
+
 esp_err_t box2_lcd_draw_bitmap(int x_start, int y_start, int x_end, int y_end,
                                const uint16_t *pixels)
 {

@@ -30,6 +30,9 @@ ESP_ERROR_CHECK(box2_motion_read(&motion));
 `main/hardware_test_utils.*` 中的提示音、麦克风峰值、SD 读写校验，以及
 `main/hardware_test_screen.*` 中的色条和测试面板，均属于测试层，不会链接进驱动库。
 
+`box2_board_power_off()` 会按照 BOX2 的硬件时序释放 `SYS_POW` 电源锁存；该接口应仅在
+确认设备由电池供电时调用。USB 接入时外部电源不会被 `SYS_POW` 切断。
+
 ## 已覆盖的硬件
 
 | 硬件 | 测试方式 |

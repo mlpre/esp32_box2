@@ -39,6 +39,7 @@
      STREAM_FRAGMENT_PAYLOAD_BYTES)
 #define STREAM_FRAGMENT_BITMAP_BYTES ((STREAM_MAX_FRAGMENTS + 7) / 8)
 #define LCD_FRAME_BYTES (BOX2_LCD_WIDTH * BOX2_LCD_HEIGHT * sizeof(uint16_t))
+#define POWER_BUTTON_HOLD_MS 1500
 
 #define WIFI_CONNECTED_BIT BIT0
 
@@ -63,6 +64,7 @@ static volatile uint32_t s_dropped_frames;
 static volatile uint64_t s_received_bytes;
 static volatile uint64_t s_display_time_us;
 static volatile uint64_t s_decode_time_us;
+static volatile bool s_display_standby;
 
 typedef struct __attribute__((packed)) {
     char magic[4];
@@ -366,6 +368,10 @@ static void display_task(void *argument)
         if (xQueueReceive(s_ready_frames, &index, portMAX_DELAY) != pdTRUE) {
             continue;
         }
+        if (s_display_standby) {
+            xQueueSend(s_free_buffers, &index, portMAX_DELAY);
+            continue;
+        }
         int64_t start = esp_timer_get_time();
         esp_err_t err = box2_lcd_draw_bitmap(0, 0, STREAM_WIDTH, STREAM_HEIGHT,
                                              (uint16_t *)s_frame_buffers[index]);
@@ -376,6 +382,58 @@ static void display_task(void *argument)
             ESP_LOGE(TAG, "LCD frame failed: %s", esp_err_to_name(err));
         }
         xQueueSend(s_free_buffers, &index, portMAX_DELAY);
+    }
+}
+
+static void power_button_task(void *argument)
+{
+    (void)argument;
+    bool was_pressed = false;
+    bool press_handled = false;
+    int64_t pressed_at_us = 0;
+
+    while (true) {
+        box2_board_state_t state = {0};
+        if (box2_board_read_state(&state, false) != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+        if (state.middle_pressed) {
+            if (!was_pressed) {
+                pressed_at_us = esp_timer_get_time();
+                press_handled = false;
+                if (s_display_standby) {
+                    ESP_LOGI(TAG, "Power key: leaving USB standby");
+                    ESP_ERROR_CHECK_WITHOUT_ABORT(box2_lcd_set_power(true));
+                    s_display_standby = false;
+                    ESP_ERROR_CHECK_WITHOUT_ABORT(
+                        box2_lcd_set_backlight(100));
+                    press_handled = true;
+                }
+            } else if (!press_handled &&
+                       esp_timer_get_time() - pressed_at_us >=
+                           POWER_BUTTON_HOLD_MS * 1000LL) {
+                press_handled = true;
+                s_display_standby = true;
+                ESP_ERROR_CHECK_WITHOUT_ABORT(box2_lcd_set_backlight(0));
+                vTaskDelay(pdMS_TO_TICKS(30));
+                ESP_ERROR_CHECK_WITHOUT_ABORT(box2_lcd_set_power(false));
+
+                if (state.charging) {
+                    ESP_LOGI(TAG,
+                             "Power key: USB power present; entered standby");
+                } else {
+                    ESP_LOGI(TAG, "Power key: releasing battery power latch");
+                    ESP_ERROR_CHECK_WITHOUT_ABORT(box2_board_power_off());
+                }
+            }
+        } else {
+            pressed_at_us = 0;
+            press_handled = false;
+        }
+        was_pressed = state.middle_pressed;
+        vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
 
@@ -588,6 +646,9 @@ static void stream_server_task(void *argument)
                 continue;
             }
             frame_in_progress = false;
+            if (s_display_standby) {
+                continue;
+            }
             uint8_t index = acquire_receive_buffer();
             int64_t decode_start = esp_timer_get_time();
             bool decoded = decode_jpeg_frame(current_frame_bytes,
@@ -672,6 +733,7 @@ static void show_waiting_screen(void)
         "UDP VIDEO PORT 5000",
         "AUTO DISCOVERY UDP 5001",
         "JPEG QUALITY 80",
+        "HOLD M 1.5S POWER",
     };
     ESP_ERROR_CHECK_WITHOUT_ABORT(
         hardware_test_screen_show_lines("BOX2 STREAM BENCH", lines,
@@ -717,9 +779,12 @@ void app_main(void)
         stream_server_task, "mjpeg_udp", 8192, NULL, 10, NULL, 0);
     BaseType_t discovery_created = xTaskCreate(
         discovery_task, "rgb_discovery", 4096, NULL, 6, NULL);
+    BaseType_t power_created = xTaskCreate(
+        power_button_task, "power_button", 3072, NULL, 7, NULL);
     ESP_ERROR_CHECK(display_created == pdPASS && stats_created == pdPASS &&
                             server_created == pdPASS &&
-                            discovery_created == pdPASS
+                            discovery_created == pdPASS &&
+                            power_created == pdPASS
                         ? ESP_OK
                         : ESP_ERR_NO_MEM);
 }
