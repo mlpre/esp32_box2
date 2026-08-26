@@ -3,12 +3,17 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#include <mmsystem.h>
 #include <swdevice.h>
 #include <wincodec.h>
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdint>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace
@@ -20,6 +25,8 @@ constexpr DWORD kSourceWidth = 480;
 constexpr DWORD kSourceHeight = 360;
 constexpr unsigned int kLcdWidth = 320;
 constexpr unsigned int kLcdHeight = 240;
+constexpr size_t kCaptureBytes = kLcdWidth * kLcdHeight * 3;
+constexpr size_t kMaxJpegBytes = kLcdWidth * kLcdHeight * sizeof(uint16_t);
 constexpr float kJpegQuality = 0.80f;
 bool g_Verbose = false;
 
@@ -120,6 +127,8 @@ public:
     {
         WSADATA data = {};
         m_WinsockReady = WSAStartup(MAKEWORD(2, 2), &data) == 0;
+        m_EncodeBuffer.reserve(kMaxJpegBytes);
+        m_PendingJpeg.reserve(kMaxJpegBytes);
         HRESULT result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         m_ComInitialized = result == S_OK || result == S_FALSE;
         result = CoCreateInstance(CLSID_WICImagingFactory, nullptr,
@@ -129,11 +138,31 @@ public:
         {
             m_WicFactory = nullptr;
         }
+        if (m_WicFactory)
+        {
+            result = CreateStreamOnHGlobal(nullptr, TRUE, &m_JpegStream);
+            if (SUCCEEDED(result))
+            {
+                ULARGE_INTEGER capacity = {};
+                capacity.QuadPart = kMaxJpegBytes;
+                result = m_JpegStream->SetSize(capacity);
+            }
+            if (FAILED(result) && m_JpegStream)
+            {
+                m_JpegStream->Release();
+                m_JpegStream = nullptr;
+            }
+        }
     }
 
     ~DisplayStreamer()
     {
-        CloseSocket();
+        Stop();
+        ReleaseCaptureResources();
+        if (m_JpegStream)
+        {
+            m_JpegStream->Release();
+        }
         if (m_WicFactory)
         {
             m_WicFactory->Release();
@@ -148,19 +177,100 @@ public:
         }
     }
 
-    bool CaptureAndSend()
+    bool Start()
     {
-        DEVMODE mode = {};
-        mode.dmSize = sizeof(mode);
-        if (!FindDisplay(mode))
+        if (!m_WinsockReady || !m_WicFactory || !m_JpegStream ||
+            !EnsureCaptureResources())
         {
-            if (g_Verbose) fwprintf(stderr, L"No 480x360 monitor found.\n");
+            return false;
+        }
+        m_Stopping = false;
+        m_SenderThread = std::thread(&DisplayStreamer::SenderLoop, this);
+        return true;
+    }
+
+    void Stop()
+    {
+        m_Stopping = true;
+        m_FrameCondition.notify_all();
+        if (m_SenderThread.joinable())
+        {
+            m_SenderThread.join();
+        }
+        CloseSocket();
+    }
+
+    bool CaptureAndQueue()
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (!m_HaveMode || now >= m_NextModeRefresh)
+        {
+            DEVMODE mode = {};
+            mode.dmSize = sizeof(mode);
+            if (!FindDisplay(mode))
+            {
+                m_HaveMode = false;
+                if (g_Verbose) fwprintf(stderr, L"No 480x360 monitor found.\n");
+                return false;
+            }
+            m_Mode = mode;
+            m_HaveMode = true;
+            m_NextModeRefresh = now + 2000;
+        }
+        if (!EnsureCaptureResources())
+        {
             return false;
         }
 
-        std::vector<uint8_t> bgr(kLcdWidth * kLcdHeight * 3);
-        HDC desktop = GetDC(nullptr);
-        HDC memory = CreateCompatibleDC(desktop);
+        BOOL captured = StretchBlt(
+            m_CaptureMemory, 0, 0, kLcdWidth, kLcdHeight,
+            m_Desktop, m_Mode.dmPosition.x, m_Mode.dmPosition.y,
+            m_Mode.dmPelsWidth, m_Mode.dmPelsHeight, SRCCOPY | CAPTUREBLT);
+        if (!captured)
+        {
+            m_HaveMode = false;
+            return false;
+        }
+        DrawCursor(m_CaptureMemory, m_Mode);
+        if (!EncodeJpeg(static_cast<const uint8_t*>(m_CapturePixels),
+                        kCaptureBytes, m_EncodeBuffer))
+        {
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_FrameMutex);
+            if (m_FrameReady)
+            {
+                ++m_OverwrittenFrames;
+            }
+            m_PendingJpeg.swap(m_EncodeBuffer);
+            m_PendingSequence = m_NextSequence++;
+            m_FrameReady = true;
+        }
+        m_FrameCondition.notify_one();
+        return true;
+    }
+
+private:
+    bool EnsureCaptureResources()
+    {
+        if (m_Desktop && m_CaptureMemory && m_CaptureBitmap && m_CapturePixels)
+        {
+            return true;
+        }
+        ReleaseCaptureResources();
+        m_Desktop = GetDC(nullptr);
+        if (!m_Desktop)
+        {
+            return false;
+        }
+        m_CaptureMemory = CreateCompatibleDC(m_Desktop);
+        if (!m_CaptureMemory)
+        {
+            ReleaseCaptureResources();
+            return false;
+        }
         BITMAPINFO info = {};
         info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         info.bmiHeader.biWidth = static_cast<LONG>(kLcdWidth);
@@ -168,87 +278,68 @@ public:
         info.bmiHeader.biPlanes = 1;
         info.bmiHeader.biBitCount = 24;
         info.bmiHeader.biCompression = BI_RGB;
-        void* pixels = nullptr;
-        HBITMAP bitmap = CreateDIBSection(memory, &info, DIB_RGB_COLORS,
-                                          &pixels, nullptr, 0);
-        if (!desktop || !memory || !bitmap || !pixels)
+        m_CaptureBitmap = CreateDIBSection(
+            m_CaptureMemory, &info, DIB_RGB_COLORS,
+            &m_CapturePixels, nullptr, 0);
+        if (!m_CaptureBitmap || !m_CapturePixels)
         {
-            if (bitmap) DeleteObject(bitmap);
-            if (memory) DeleteDC(memory);
-            if (desktop) ReleaseDC(nullptr, desktop);
+            ReleaseCaptureResources();
             return false;
         }
-
-        HGDIOBJ previous = SelectObject(memory, bitmap);
-        SetStretchBltMode(memory, HALFTONE);
-        SetBrushOrgEx(memory, 0, 0, nullptr);
-        BOOL captured = StretchBlt(memory, 0, 0, kLcdWidth, kLcdHeight,
-                                   desktop, mode.dmPosition.x, mode.dmPosition.y,
-                                   mode.dmPelsWidth, mode.dmPelsHeight,
-                                   SRCCOPY | CAPTUREBLT);
-        if (captured)
-        {
-            DrawCursor(memory, mode);
-            memcpy(bgr.data(), pixels, bgr.size());
-        }
-        SelectObject(memory, previous);
-        DeleteObject(bitmap);
-        DeleteDC(memory);
-        ReleaseDC(nullptr, desktop);
-        if (!captured)
-        {
-            return false;
-        }
-
-        std::vector<uint8_t> jpeg;
-        if (!EncodeJpeg(bgr, jpeg))
-        {
-            return false;
-        }
-
-        if (m_Socket == INVALID_SOCKET && !DiscoverAndConnect())
-        {
-            return false;
-        }
-
-        JpegFrameHeader header = {
-            {'B', '2', 'J', '3'},
-            htonl(static_cast<uint32_t>(jpeg.size())),
-            htonl(m_Sequence++),
-            htons(static_cast<uint16_t>(kLcdWidth)),
-            htons(static_cast<uint16_t>(kLcdHeight)),
-        };
-        if (!SendAll(reinterpret_cast<const uint8_t*>(&header), sizeof(header)) ||
-            !SendAll(jpeg.data(), jpeg.size()))
-        {
-            CloseSocket();
-            return false;
-        }
+        m_PreviousBitmap = SelectObject(m_CaptureMemory, m_CaptureBitmap);
+        SetStretchBltMode(m_CaptureMemory, HALFTONE);
+        SetBrushOrgEx(m_CaptureMemory, 0, 0, nullptr);
         return true;
     }
 
-private:
-    bool EncodeJpeg(const std::vector<uint8_t>& Pixels,
-                    std::vector<uint8_t>& Encoded) const
+    void ReleaseCaptureResources()
     {
-        if (!m_WicFactory)
+        if (m_CaptureMemory && m_PreviousBitmap)
+        {
+            SelectObject(m_CaptureMemory, m_PreviousBitmap);
+        }
+        if (m_CaptureBitmap)
+        {
+            DeleteObject(m_CaptureBitmap);
+        }
+        if (m_CaptureMemory)
+        {
+            DeleteDC(m_CaptureMemory);
+        }
+        if (m_Desktop)
+        {
+            ReleaseDC(nullptr, m_Desktop);
+        }
+        m_Desktop = nullptr;
+        m_CaptureMemory = nullptr;
+        m_CaptureBitmap = nullptr;
+        m_PreviousBitmap = nullptr;
+        m_CapturePixels = nullptr;
+    }
+
+    bool EncodeJpeg(const uint8_t* Pixels, size_t PixelBytes,
+                    std::vector<uint8_t>& Encoded)
+    {
+        if (!m_WicFactory || !m_JpegStream)
+        {
+            return false;
+        }
+        LARGE_INTEGER start = {};
+        HRESULT result = m_JpegStream->Seek(start, STREAM_SEEK_SET, nullptr);
+        if (FAILED(result))
         {
             return false;
         }
 
-        IStream* stream = nullptr;
         IWICBitmapEncoder* encoder = nullptr;
         IWICBitmapFrameEncode* frame = nullptr;
         IPropertyBag2* properties = nullptr;
-        HRESULT result = CreateStreamOnHGlobal(nullptr, TRUE, &stream);
+        result = m_WicFactory->CreateEncoder(GUID_ContainerFormatJpeg,
+                                             nullptr, &encoder);
         if (SUCCEEDED(result))
         {
-            result = m_WicFactory->CreateEncoder(GUID_ContainerFormatJpeg,
-                                                 nullptr, &encoder);
-        }
-        if (SUCCEEDED(result))
-        {
-            result = encoder->Initialize(stream, WICBitmapEncoderNoCache);
+            result = encoder->Initialize(m_JpegStream,
+                                         WICBitmapEncoderNoCache);
         }
         if (SUCCEEDED(result))
         {
@@ -277,21 +368,28 @@ private:
         {
             result = frame->WritePixels(
                 kLcdHeight, kLcdWidth * 3,
-                static_cast<UINT>(Pixels.size()),
-                const_cast<BYTE*>(Pixels.data()));
+                static_cast<UINT>(PixelBytes),
+                const_cast<BYTE*>(Pixels));
         }
         if (SUCCEEDED(result)) result = frame->Commit();
         if (SUCCEEDED(result)) result = encoder->Commit();
 
         HGLOBAL memory = nullptr;
-        STATSTG statistics = {};
-        if (SUCCEEDED(result)) result = GetHGlobalFromStream(stream, &memory);
-        if (SUCCEEDED(result)) result = stream->Stat(&statistics, STATFLAG_NONAME);
-        if (SUCCEEDED(result) && statistics.cbSize.HighPart == 0)
+        ULARGE_INTEGER position = {};
+        if (SUCCEEDED(result))
         {
-            const size_t size = statistics.cbSize.LowPart;
+            LARGE_INTEGER offset = {};
+            result = m_JpegStream->Seek(offset, STREAM_SEEK_CUR, &position);
+        }
+        if (SUCCEEDED(result))
+        {
+            result = GetHGlobalFromStream(m_JpegStream, &memory);
+        }
+        if (SUCCEEDED(result) && position.HighPart == 0)
+        {
+            const size_t size = position.LowPart;
             const void* data = GlobalLock(memory);
-            if (data && size > 0 && size <= UINT32_MAX)
+            if (data && size > 0 && size <= kMaxJpegBytes)
             {
                 const auto first = static_cast<const uint8_t*>(data);
                 Encoded.assign(first, first + size);
@@ -310,8 +408,50 @@ private:
         if (properties) properties->Release();
         if (frame) frame->Release();
         if (encoder) encoder->Release();
-        if (stream) stream->Release();
         return SUCCEEDED(result) && !Encoded.empty();
+    }
+
+    void SenderLoop()
+    {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        std::vector<uint8_t> jpeg;
+        jpeg.reserve(kMaxJpegBytes);
+        while (!m_Stopping)
+        {
+            uint32_t sequence = 0;
+            {
+                std::unique_lock<std::mutex> lock(m_FrameMutex);
+                m_FrameCondition.wait(lock, [this]
+                {
+                    return m_Stopping || m_FrameReady;
+                });
+                if (m_Stopping)
+                {
+                    break;
+                }
+                jpeg.swap(m_PendingJpeg);
+                sequence = m_PendingSequence;
+                m_FrameReady = false;
+            }
+
+            if (m_Socket == INVALID_SOCKET && !DiscoverAndConnect())
+            {
+                continue;
+            }
+            JpegFrameHeader header = {
+                {'B', '2', 'J', '3'},
+                htonl(static_cast<uint32_t>(jpeg.size())),
+                htonl(sequence),
+                htons(static_cast<uint16_t>(kLcdWidth)),
+                htons(static_cast<uint16_t>(kLcdHeight)),
+            };
+            if (!SendAll(reinterpret_cast<const uint8_t*>(&header),
+                         sizeof(header)) ||
+                !SendAll(jpeg.data(), jpeg.size()))
+            {
+                CloseSocket();
+            }
+        }
     }
 
     static void DrawCursor(HDC Target, const DEVMODE& Mode)
@@ -679,8 +819,26 @@ private:
     bool m_WinsockReady = false;
     bool m_ComInitialized = false;
     IWICImagingFactory* m_WicFactory = nullptr;
+    IStream* m_JpegStream = nullptr;
+    HDC m_Desktop = nullptr;
+    HDC m_CaptureMemory = nullptr;
+    HBITMAP m_CaptureBitmap = nullptr;
+    HGDIOBJ m_PreviousBitmap = nullptr;
+    void* m_CapturePixels = nullptr;
+    DEVMODE m_Mode = {};
+    bool m_HaveMode = false;
+    ULONGLONG m_NextModeRefresh = 0;
+    std::vector<uint8_t> m_EncodeBuffer;
+    std::vector<uint8_t> m_PendingJpeg;
+    std::mutex m_FrameMutex;
+    std::condition_variable m_FrameCondition;
+    std::thread m_SenderThread;
+    std::atomic<bool> m_Stopping = true;
+    bool m_FrameReady = false;
+    uint32_t m_PendingSequence = 0;
+    uint32_t m_NextSequence = 0;
+    uint64_t m_OverwrittenFrames = 0;
     SOCKET m_Socket = INVALID_SOCKET;
-    uint32_t m_Sequence = 0;
 };
 
 struct CreationContext
@@ -790,18 +948,29 @@ int wmain(int argc, wchar_t** argv)
         Sleep(250);
     }
     DisplayStreamer streamer;
+    const bool timerResolutionSet = timeBeginPeriod(1) == TIMERR_NOERROR;
+    if (!streamer.Start())
+    {
+        fwprintf(stderr, L"BOX-2 capture pipeline initialization failed.\n");
+        if (timerResolutionSet) timeEndPeriod(1);
+        SwDeviceClose(softwareDevice);
+        return 4;
+    }
     while (true)
     {
         ULONGLONG start = GetTickCount64();
-        bool sent = streamer.CaptureAndSend();
+        bool captured = streamer.CaptureAndQueue();
         ULONGLONG elapsed = GetTickCount64() - start;
-        DWORD delay = sent ? static_cast<DWORD>(elapsed < 33 ? 33 - elapsed : 1)
-                           : 500;
+        DWORD delay = captured
+                          ? static_cast<DWORD>(elapsed < 33 ? 33 - elapsed : 1)
+                          : 500;
         if (WaitForSingleObject(g_StopEvent, delay) == WAIT_OBJECT_0)
         {
             break;
         }
     }
+    streamer.Stop();
+    if (timerResolutionSet) timeEndPeriod(1);
 
     SwDeviceClose(softwareDevice);
     CloseHandle(creationEvent);

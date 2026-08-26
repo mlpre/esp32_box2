@@ -53,4 +53,7 @@ and fixed `320 x 240` dimensions.
 The host captures and encodes at up to 30 FPS. The ESP32 decodes each JPEG
 directly to RGB565 little-endian in an aligned PSRAM buffer, keeps only the
 latest completed frame waiting for the LCD, and drops stale completed frames
-instead of accumulating display latency.
+instead of accumulating display latency. The Windows host reuses its GDI
+capture surface and JPEG memory stream, and runs TCP transmission on a separate
+thread backed by a single latest-frame slot. Network stalls can therefore
+replace an old unsent frame without blocking capture or building a backlog.
