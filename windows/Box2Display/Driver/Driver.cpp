@@ -27,8 +27,8 @@ using namespace Microsoft::WRL;
 #pragma region SampleMonitors
 
 static constexpr DWORD IDD_SAMPLE_MONITOR_COUNT = 1;
-static constexpr UINT BOX2_SOURCE_WIDTH = 640;
-static constexpr UINT BOX2_SOURCE_HEIGHT = 480;
+static constexpr UINT BOX2_SOURCE_WIDTH = 480;
+static constexpr UINT BOX2_SOURCE_HEIGHT = 360;
 
 // Default modes reported for edid-less monitors. The first mode is set as preferred
 static const struct IndirectSampleMonitor::SampleMonitorMode s_SampleDefaultModes[] =

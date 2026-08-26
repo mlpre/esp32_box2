@@ -15,8 +15,8 @@ namespace
 constexpr wchar_t kStopEventName[] = L"Local\\Box2DisplayHostStop";
 constexpr wchar_t kMutexName[] = L"Local\\Box2DisplayHostSingleton";
 constexpr unsigned short kDiscoveryPort = 5001;
-constexpr DWORD kSourceWidth = 640;
-constexpr DWORD kSourceHeight = 480;
+constexpr DWORD kSourceWidth = 480;
+constexpr DWORD kSourceHeight = 360;
 constexpr unsigned int kLcdWidth = 320;
 constexpr unsigned int kLcdHeight = 240;
 constexpr size_t kFrameBytes = kLcdWidth * kLcdHeight * sizeof(uint16_t);
@@ -127,7 +127,7 @@ public:
         mode.dmSize = sizeof(mode);
         if (!FindDisplay(mode))
         {
-            if (g_Verbose) fwprintf(stderr, L"No 640x480 monitor found.\n");
+            if (g_Verbose) fwprintf(stderr, L"No 480x360 monitor found.\n");
             return false;
         }
 
@@ -153,7 +153,8 @@ public:
         }
 
         HGDIOBJ previous = SelectObject(memory, bitmap);
-        SetStretchBltMode(memory, COLORONCOLOR);
+        SetStretchBltMode(memory, HALFTONE);
+        SetBrushOrgEx(memory, 0, 0, nullptr);
         BOOL captured = StretchBlt(memory, 0, 0, kLcdWidth, kLcdHeight,
                                    desktop, mode.dmPosition.x, mode.dmPosition.y,
                                    mode.dmPelsWidth, mode.dmPelsHeight,
@@ -626,7 +627,7 @@ int wmain(int argc, wchar_t** argv)
     g_Verbose = argc > 1 && _wcsicmp(argv[1], L"--verbose") == 0;
 
     // Monitor coordinates must stay in physical pixels even when the primary
-    // display uses Windows scaling. Otherwise a 640x480 target can be exposed
+    // display uses Windows scaling. Otherwise a 480x360 target can be exposed
     // to this process as a smaller, DPI-virtualized rectangle.
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 

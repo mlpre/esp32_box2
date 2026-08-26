@@ -1,9 +1,10 @@
 # BOX-2 Wi-Fi Display
 
 This project turns the BOX-2 LCD into a Windows 11 extended display. The
-indirect display driver exposes one landscape `640 x 480 @ 30 Hz` monitor. The
+indirect display driver exposes one landscape `480 x 360 @ 30 Hz` monitor. The
 elevated host process captures that monitor, scales it to the LCD's native
-`320 x 240` resolution, converts BGRA8 to RGB565 little-endian, and streams it
+`320 x 240` resolution using high-quality downscaling, converts BGRA8 to
+RGB565 little-endian, and streams it
 over Wi-Fi. Only landscape mode is exposed. The host also draws an enlarged
 cursor and a high-contrast hot-spot ring into the transmitted image.
 
