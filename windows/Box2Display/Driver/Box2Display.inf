@@ -1,0 +1,64 @@
+; BOX-2 Wi-Fi indirect display driver
+
+[Version]
+PnpLockDown=1
+Signature="$Windows NT$"
+ClassGUID={4D36E968-E325-11CE-BFC1-08002BE10318}
+Class=Display
+ClassVer=2.0
+Provider=%ManufacturerName%
+CatalogFile=Box2Display.cat
+DriverVer=08/26/2026,1.0.0.0
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64.10.0...22000
+
+[Standard.NTamd64.10.0...22000]
+%DeviceName%=Box2Display_Install,Box2Display
+
+[SourceDisksFiles]
+Box2Display.dll=1
+
+[SourceDisksNames]
+1=%DiskName%
+
+[Box2Display_Install.NT]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT
+CopyFiles=UMDriverCopy
+
+[Box2Display_Install.NT.hw]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.HW
+AddReg=Box2Display_HardwareDeviceSettings
+
+[Box2Display_HardwareDeviceSettings]
+HKR,,"UpperFilters",%REG_MULTI_SZ%,"IndirectKmd"
+HKR,"WUDF","DeviceGroupId",%REG_SZ%,"Box2DisplayDriverGroup"
+
+[Box2Display_Install.NT.Services]
+Include=WUDFRD.inf
+Needs=WUDFRD.NT.Services
+
+[Box2Display_Install.NT.Wdf]
+UmdfService=Box2Display,Box2Display_Service
+UmdfServiceOrder=Box2Display
+UmdfKernelModeClientPolicy=AllowKernelModeClients
+
+[Box2Display_Service]
+UmdfLibraryVersion=$UMDFVERSION$
+ServiceBinary=%12%\UMDF\Box2Display.dll
+UmdfExtensions=IddCx0102
+
+[DestinationDirs]
+UMDriverCopy=12,UMDF
+
+[UMDriverCopy]
+Box2Display.dll
+
+[Strings]
+ManufacturerName="BOX-2 Project"
+DiskName="BOX-2 Wi-Fi Display Installation Disk"
+DeviceName="BOX-2 Wi-Fi Display Adapter"
+REG_MULTI_SZ=0x00010000
+REG_SZ=0x00000000

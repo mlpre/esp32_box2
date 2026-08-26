@@ -1,0 +1,4 @@
+out/
+*.log
+*-debug.txt
+uac-*.txt

@@ -113,7 +113,9 @@ esp_err_t box2_lcd_init(void)
         .flags = {
             .cs_active_high = 0,
             .reverse_color_bits = 0,
-            .swap_color_bytes = 0,
+            // RGB565 buffers use the CPU-native little-endian layout. The
+            // 8-bit panel bus must put the high byte on the wire first.
+            .swap_color_bytes = 1,
             .pclk_active_neg = 0,
             .pclk_idle_low = 0,
         },
@@ -207,10 +209,12 @@ esp_err_t box2_lcd_init(void)
     ESP_RETURN_ON_ERROR(lcd_command(0xe0, e0, sizeof(e0)), TAG, "LCD gamma E0");
     ESP_RETURN_ON_ERROR(lcd_command(0xe1, e1, sizeof(e1)), TAG, "LCD gamma E1");
     ESP_RETURN_ON_ERROR(lcd_command(0xb7, &b7, 1), TAG, "LCD sequence B7");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_swap_xy(s_panel, false), TAG,
-                        "disable LCD XY swap");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_mirror(s_panel, false, false), TAG,
-                        "disable LCD mirror");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_swap_xy(s_panel, true), TAG,
+                        "enable landscape LCD XY swap");
+    // XY swap alone is a diagonal reflection. Combining it with X mirroring
+    // produces a true 90-degree landscape rotation with readable text.
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_mirror(s_panel, true, false), TAG,
+                        "rotate LCD to readable landscape orientation");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_panel, true), TAG,
                         "turn display on");
     return box2_lcd_set_backlight(100);

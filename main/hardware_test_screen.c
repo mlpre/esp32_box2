@@ -5,15 +5,15 @@
 #include "box2_lcd.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
-#define SCREEN_WIDTH 240
-#define SCREEN_HEIGHT 320
+#define SCREEN_WIDTH 320
+#define SCREEN_HEIGHT 240
 static const char *TAG = "box2_test_screen";
 static uint16_t *s_framebuffer;
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 {
     uint16_t color = (uint16_t)(((uint16_t)(r & 0xf8) << 8) |
                                 ((uint16_t)(g & 0xfc) << 3) | (b >> 3));
-    return (uint16_t)((color << 8) | (color >> 8));
+    return color;
 }
 
 static esp_err_t ensure_framebuffer(void)
@@ -150,12 +150,12 @@ static void draw_text(int x, int y, const char *text, int scale, uint16_t color)
 
 static void draw_meter(int meter_percent)
 {
-    fill_rect(0, 282, SCREEN_WIDTH, 38, rgb565(5, 10, 20));
-    draw_text(6, 284, "MIC", 1, rgb565(150, 170, 190));
-    fill_rect(30, 283, 204, 11, rgb565(25, 35, 50));
-    fill_rect(32, 285, meter_percent * 200 / 100, 7,
+    fill_rect(0, 202, SCREEN_WIDTH, 38, rgb565(5, 10, 20));
+    draw_text(6, 204, "MIC", 1, rgb565(150, 170, 190));
+    fill_rect(30, 203, 284, 11, rgb565(25, 35, 50));
+    fill_rect(32, 205, meter_percent * 280 / 100, 7,
               meter_percent > 85 ? rgb565(255, 70, 50) : rgb565(40, 210, 100));
-    draw_text(6, 301, "LIVE AUDIO INPUT LEVEL", 1, rgb565(100, 190, 230));
+    draw_text(6, 221, "LIVE AUDIO INPUT LEVEL", 1, rgb565(100, 190, 230));
 }
 
 esp_err_t hardware_test_screen_show_color_bars(void)
@@ -172,12 +172,15 @@ esp_err_t hardware_test_screen_show_color_bars(void)
     };
     for (int i = 0; i < 6; ++i)
     {
-        fill_rect(i * 40, 0, 40, 145, rgb565(colors[i][0], colors[i][1], colors[i][2]));
+        int x = i * SCREEN_WIDTH / 6;
+        int next_x = (i + 1) * SCREEN_WIDTH / 6;
+        fill_rect(x, 0, next_x - x, 105,
+                  rgb565(colors[i][0], colors[i][1], colors[i][2]));
     }
-    fill_rect(0, 145, SCREEN_WIDTH, 175, rgb565(8, 14, 25));
-    draw_text(24, 180, "BOX2 LCD TEST", 2, rgb565(255, 255, 255));
-    draw_text(36, 220, "240 X 320", 2, rgb565(80, 220, 255));
-    draw_text(12, 270, "RGB BARS AND BACKLIGHT", 1, rgb565(255, 210, 60));
+    fill_rect(0, 105, SCREEN_WIDTH, 135, rgb565(8, 14, 25));
+    draw_text(76, 128, "BOX2 LCD TEST", 2, rgb565(255, 255, 255));
+    draw_text(100, 166, "320 X 240", 2, rgb565(80, 220, 255));
+    draw_text(68, 205, "RGB BARS AND BACKLIGHT", 1, rgb565(255, 210, 60));
     return box2_lcd_draw_bitmap(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, s_framebuffer);
 }
 
@@ -188,8 +191,8 @@ esp_err_t hardware_test_screen_show_lines(const char *title,
 {
     ESP_RETURN_ON_FALSE(title && lines, ESP_ERR_INVALID_ARG, TAG, "invalid screen text");
     ESP_RETURN_ON_ERROR(ensure_framebuffer(), TAG, "allocate test framebuffer");
-    if (line_count > 17)
-        line_count = 17;
+    if (line_count > 11)
+        line_count = 11;
     if (meter_percent < 0)
         meter_percent = 0;
     if (meter_percent > 100)

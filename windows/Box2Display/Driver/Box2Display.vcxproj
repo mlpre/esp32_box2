@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{5B7E1D5E-4B4D-4C62-A3ED-6B80F66CE610}</ProjectGuid>
+    <TemplateGuid>{32909489-7be5-497b-aafa-db6669d9b44b}</TemplateGuid>
+    <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
+    <RootNamespace>Box2Display</RootNamespace>
+  </PropertyGroup>
+  <PropertyGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <PlatformToolset>WindowsUserModeDriver10.0</PlatformToolset>
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <UMDF_VERSION_MAJOR>2</UMDF_VERSION_MAJOR>
+    <UMDF_VERSION_MINOR>25</UMDF_VERSION_MINOR>
+    <IndirectDisplayDriver>true</IndirectDisplayDriver>
+    <IDDCX_VERSION_MAJOR>1</IDDCX_VERSION_MAJOR>
+    <IDDCX_VERSION_MINOR>4</IDDCX_VERSION_MINOR>
+    <Driver_SpectreMitigation>false</Driver_SpectreMitigation>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" />
+  </ImportGroup>
+  <PropertyGroup>
+    <OutDir>$(MSBuildThisFileDirectory)..\out\Driver\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)..\out\obj\Driver\</IntDir>
+    <TargetName>Box2Display</TargetName>
+    <SignMode>Off</SignMode>
+    <SkipPackageVerification>true</SkipPackageVerification>
+    <Inf2CatUseLocalTime>true</Inf2CatUseLocalTime>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WppEnabled>true</WppEnabled>
+      <WppRecorderEnabled>true</WppRecorderEnabled>
+      <WppScanConfigurationData Condition="'%(ClCompile.ScanConfigurationData)' == ''">Trace.h</WppScanConfigurationData>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <EnablePREfast>true</EnablePREfast>
+      <WarningLevel>Level4</WarningLevel>
+      <PreprocessorDefinitions>_WIN64;_AMD64_;AMD64;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalOptions>/D_ATL_NO_WIN_SUPPORT /DUMDF_DRIVER /DIDDCX_VERSION_MAJOR=1 /DIDDCX_VERSION_MINOR=6 /DIDDCX_MINIMUM_VERSION_REQUIRED=4 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>%(AdditionalDependencies);OneCoreUAP.lib;avrt.lib</AdditionalDependencies>
+    </Link>
+    <DriverSign>
+      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
+    </DriverSign>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="Driver.cpp" />
+    <ClInclude Include="Driver.h" />
+    <ClInclude Include="Trace.h" />
+    <Inf Include="Box2Display.inf" />
+    <ResourceCompile Include="Box2Display.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <FilesToPackage Include="$(TargetPath)" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

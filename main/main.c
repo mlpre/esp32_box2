@@ -137,7 +137,7 @@ static void update_screen(bool lcd_ok, bool audio_ok, bool board_ok,
     snprintf(text[2], sizeof(text[2]), "XIO %s RAW=%04X SAFE=%s",
              board->expander_outputs_ok ? "OK" : "FAIL", board->xio,
              board->expander_outputs_ok ? "OK" : "FAIL");
-    snprintf(text[3], sizeof(text[3]), "LCD OK 240X320 I80 BL=PWM");
+    snprintf(text[3], sizeof(text[3]), "LCD OK 320X240 I80 BL=PWM");
     snprintf(text[4], sizeof(text[4]), "AUDIO %s MIC=%d %s", audio_ok ? "OK" : "FAIL",
              mic_peak, audio_ok ? "LIVE" : "OFF");
     snprintf(text[5], sizeof(text[5]), "WIFI %s AP=%u RSSI=%dDBM", s_wifi.scan_ok ? "OK" : "FAIL",
