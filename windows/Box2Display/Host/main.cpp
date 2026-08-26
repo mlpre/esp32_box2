@@ -20,6 +20,7 @@ constexpr DWORD kSourceHeight = 360;
 constexpr unsigned int kLcdWidth = 320;
 constexpr unsigned int kLcdHeight = 240;
 constexpr size_t kFrameBytes = kLcdWidth * kLcdHeight * sizeof(uint16_t);
+constexpr uint32_t kPayloadRleFlag = 0x80000000u;
 bool g_Verbose = false;
 
 bool EnsureLandscapeMode()
@@ -100,6 +101,17 @@ struct StreamAck
     char Magic[4];
     uint16_t Version;
     uint16_t Status;
+};
+
+struct FrameUpdateHeader
+{
+    char Magic[4];
+    uint16_t X;
+    uint16_t Y;
+    uint16_t Width;
+    uint16_t Height;
+    uint32_t PayloadBytes;
+    uint32_t Sequence;
 };
 #pragma pack(pop)
 
@@ -190,15 +202,141 @@ public:
         {
             return false;
         }
-        if (!SendAll(frame.data(), frame.size()))
+
+        unsigned int minX = 0;
+        unsigned int minY = 0;
+        unsigned int maxX = kLcdWidth - 1;
+        unsigned int maxY = kLcdHeight - 1;
+        if (!m_NeedsKeyFrame && m_PreviousFrame.size() == frame.size())
+        {
+            minX = kLcdWidth;
+            minY = kLcdHeight;
+            maxX = 0;
+            maxY = 0;
+            for (unsigned int y = 0; y < kLcdHeight; ++y)
+            {
+                for (unsigned int x = 0; x < kLcdWidth; ++x)
+                {
+                    size_t offset = (static_cast<size_t>(y) * kLcdWidth + x) * 2;
+                    if (frame[offset] == m_PreviousFrame[offset] &&
+                        frame[offset + 1] == m_PreviousFrame[offset + 1])
+                    {
+                        continue;
+                    }
+                    minX = (std::min)(minX, x);
+                    minY = (std::min)(minY, y);
+                    maxX = (std::max)(maxX, x);
+                    maxY = (std::max)(maxY, y);
+                }
+            }
+            if (minX == kLcdWidth)
+            {
+                return true;
+            }
+
+            // Include a small border for antialiased text and cursor edges.
+            minX = minX > 2 ? minX - 2 : 0;
+            minY = minY > 2 ? minY - 2 : 0;
+            maxX = (std::min)(maxX + 2, kLcdWidth - 1);
+            maxY = (std::min)(maxY + 2, kLcdHeight - 1);
+        }
+
+        const unsigned int width = maxX - minX + 1;
+        const unsigned int height = maxY - minY + 1;
+        std::vector<uint8_t> update(static_cast<size_t>(width) * height * 2);
+        for (unsigned int row = 0; row < height; ++row)
+        {
+            const size_t sourceOffset =
+                (static_cast<size_t>(minY + row) * kLcdWidth + minX) * 2;
+            memcpy(update.data() + static_cast<size_t>(row) * width * 2,
+                   frame.data() + sourceOffset, static_cast<size_t>(width) * 2);
+        }
+
+        std::vector<uint8_t> encoded = EncodeRgb565Rle(update);
+        const bool useRle = encoded.size() < update.size();
+        const std::vector<uint8_t>& payload = useRle ? encoded : update;
+        const uint32_t payloadField = static_cast<uint32_t>(payload.size()) |
+                                      (useRle ? kPayloadRleFlag : 0u);
+
+        FrameUpdateHeader header = {
+            {'B', '2', 'F', '2'},
+            htons(static_cast<uint16_t>(minX)),
+            htons(static_cast<uint16_t>(minY)),
+            htons(static_cast<uint16_t>(width)),
+            htons(static_cast<uint16_t>(height)),
+            htonl(payloadField),
+            htonl(m_Sequence++),
+        };
+        if (!SendAll(reinterpret_cast<const uint8_t*>(&header), sizeof(header)) ||
+            !SendAll(payload.data(), payload.size()))
         {
             CloseSocket();
             return false;
         }
+        m_PreviousFrame = std::move(frame);
+        m_NeedsKeyFrame = false;
         return true;
     }
 
 private:
+    static std::vector<uint8_t> EncodeRgb565Rle(
+        const std::vector<uint8_t>& Pixels)
+    {
+        const size_t pixelCount = Pixels.size() / 2;
+        std::vector<uint8_t> encoded;
+        encoded.reserve(Pixels.size());
+        auto samePixel = [&Pixels](size_t left, size_t right)
+        {
+            return Pixels[left * 2] == Pixels[right * 2] &&
+                   Pixels[left * 2 + 1] == Pixels[right * 2 + 1];
+        };
+
+        size_t position = 0;
+        while (position < pixelCount)
+        {
+            size_t runLength = 1;
+            while (position + runLength < pixelCount && runLength < 128 &&
+                   samePixel(position, position + runLength))
+            {
+                ++runLength;
+            }
+            if (runLength >= 3)
+            {
+                encoded.push_back(static_cast<uint8_t>(0x80 | (runLength - 1)));
+                encoded.push_back(Pixels[position * 2]);
+                encoded.push_back(Pixels[position * 2 + 1]);
+                position += runLength;
+                continue;
+            }
+
+            const size_t literalStart = position;
+            size_t literalLength = 0;
+            while (position < pixelCount && literalLength < 128)
+            {
+                runLength = 1;
+                while (position + runLength < pixelCount && runLength < 128 &&
+                       samePixel(position, position + runLength))
+                {
+                    ++runLength;
+                }
+                if (runLength >= 3)
+                {
+                    break;
+                }
+                ++position;
+                ++literalLength;
+            }
+            encoded.push_back(static_cast<uint8_t>(literalLength - 1));
+            using Difference = std::vector<uint8_t>::difference_type;
+            encoded.insert(
+                encoded.end(),
+                Pixels.begin() + static_cast<Difference>(literalStart * 2),
+                Pixels.begin() +
+                    static_cast<Difference>((literalStart + literalLength) * 2));
+        }
+        return encoded;
+    }
+
     static void DrawCursor(HDC Target, const DEVMODE& Mode)
     {
         CURSORINFO cursor = {};
@@ -220,16 +358,8 @@ private:
         int pointerX = MulDiv(relativeX, kLcdWidth, Mode.dmPelsWidth);
         int pointerY = MulDiv(relativeY, kLcdHeight, Mode.dmPelsHeight);
 
-        // Mark the exact hot spot with a high-contrast ring, then draw an
-        // enlarged native cursor so it remains legible on the 320x240 LCD.
-        HGDIOBJ oldBrush = SelectObject(Target, GetStockObject(HOLLOW_BRUSH));
-        HPEN blackPen = CreatePen(PS_SOLID, 4, RGB(0, 0, 0));
-        HGDIOBJ oldPen = SelectObject(Target, blackPen);
-        Ellipse(Target, pointerX - 8, pointerY - 8, pointerX + 9, pointerY + 9);
-        HPEN whitePen = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
-        SelectObject(Target, whitePen);
-        Ellipse(Target, pointerX - 8, pointerY - 8, pointerX + 9, pointerY + 9);
-
+        // Draw only the enlarged native cursor; the additional hot-spot ring
+        // obscures small controls on the 320x240 LCD.
         constexpr int cursorSize = 28;
         int drawX = pointerX;
         int drawY = pointerY;
@@ -247,11 +377,6 @@ private:
         }
         DrawIconEx(Target, drawX, drawY, cursor.hCursor, cursorSize, cursorSize,
                    0, nullptr, DI_NORMAL);
-
-        SelectObject(Target, oldPen);
-        SelectObject(Target, oldBrush);
-        DeleteObject(blackPen);
-        DeleteObject(whitePen);
     }
 
     bool FindDisplay(DEVMODE& Mode)
@@ -419,7 +544,7 @@ private:
         setsockopt(stream, SOL_SOCKET, SO_RCVTIMEO,
                    reinterpret_cast<const char*>(&receiveTimeout), sizeof(receiveTimeout));
 
-        StreamHello hello = {{'B', '2', 'D', 'S'}, htons(1),
+        StreamHello hello = {{'B', '2', 'D', 'S'}, htons(2),
                              htons(static_cast<uint16_t>(kLcdWidth)),
                              htons(static_cast<uint16_t>(kLcdHeight)), htons(1)};
         size_t helloSent = 0;
@@ -448,13 +573,14 @@ private:
             }
             ackReceived += static_cast<size_t>(result);
         }
-        if (memcmp(ack.Magic, "B2DA", 4) != 0 || ntohs(ack.Version) != 1 ||
+        if (memcmp(ack.Magic, "B2DA", 4) != 0 || ntohs(ack.Version) != 2 ||
             ntohs(ack.Status) != 0)
         {
             closesocket(stream);
             return false;
         }
         m_Socket = stream;
+        m_NeedsKeyFrame = true;
         if (g_Verbose) fwprintf(stderr, L"Connected to BOX-2 stream.\n");
         return true;
     }
@@ -572,10 +698,14 @@ private:
             closesocket(m_Socket);
             m_Socket = INVALID_SOCKET;
         }
+        m_NeedsKeyFrame = true;
     }
 
     bool m_WinsockReady = false;
     SOCKET m_Socket = INVALID_SOCKET;
+    bool m_NeedsKeyFrame = true;
+    uint32_t m_Sequence = 0;
+    std::vector<uint8_t> m_PreviousFrame;
 };
 
 struct CreationContext
@@ -690,7 +820,7 @@ int wmain(int argc, wchar_t** argv)
         ULONGLONG start = GetTickCount64();
         bool sent = streamer.CaptureAndSend();
         ULONGLONG elapsed = GetTickCount64() - start;
-        DWORD delay = sent ? static_cast<DWORD>(elapsed < 67 ? 67 - elapsed : 1)
+        DWORD delay = sent ? static_cast<DWORD>(elapsed < 33 ? 33 - elapsed : 1)
                            : 500;
         if (WaitForSingleObject(g_StopEvent, delay) == WAIT_OBJECT_0)
         {

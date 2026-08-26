@@ -33,6 +33,8 @@
 #define STREAM_BUFFER_COUNT 3
 #define STREAM_FRAME_BYTES (STREAM_WIDTH * STREAM_HEIGHT * sizeof(uint16_t))
 #define LCD_FRAME_BYTES (BOX2_LCD_WIDTH * BOX2_LCD_HEIGHT * sizeof(uint16_t))
+#define STREAM_PAYLOAD_RLE_FLAG UINT32_C(0x80000000)
+#define STREAM_PAYLOAD_SIZE_MASK UINT32_C(0x7fffffff)
 
 #define WIFI_CONNECTED_BIT BIT0
 
@@ -48,6 +50,7 @@ static EventGroupHandle_t s_wifi_events;
 static QueueHandle_t s_free_buffers;
 static QueueHandle_t s_ready_frames;
 static uint8_t *s_frame_buffers[STREAM_BUFFER_COUNT];
+static uint8_t *s_encoded_buffer;
 
 static volatile uint32_t s_received_frames;
 static volatile uint32_t s_displayed_frames;
@@ -83,6 +86,24 @@ typedef struct __attribute__((packed)) {
     uint16_t version;
     uint16_t status;
 } stream_ack_t;
+
+typedef struct __attribute__((packed)) {
+    char magic[4];
+    uint16_t x;
+    uint16_t y;
+    uint16_t width;
+    uint16_t height;
+    uint32_t payload_bytes;
+    uint32_t sequence;
+} frame_update_header_t;
+
+typedef struct {
+    uint8_t buffer_index;
+    uint16_t x;
+    uint16_t y;
+    uint16_t width;
+    uint16_t height;
+} ready_update_t;
 
 static void trim_line(char *line)
 {
@@ -275,7 +296,7 @@ static esp_err_t run_lcd_benchmark(const char *name, int x, int y, int width,
 static esp_err_t initialize_frame_buffers(void)
 {
     s_free_buffers = xQueueCreate(STREAM_BUFFER_COUNT, sizeof(uint8_t));
-    s_ready_frames = xQueueCreate(1, sizeof(uint8_t));
+    s_ready_frames = xQueueCreate(STREAM_BUFFER_COUNT, sizeof(ready_update_t));
     ESP_RETURN_ON_FALSE(s_free_buffers && s_ready_frames, ESP_ERR_NO_MEM, TAG,
                         "create frame queues");
 
@@ -289,6 +310,10 @@ static esp_err_t initialize_frame_buffers(void)
                      STREAM_HEIGHT);
         xQueueSend(s_free_buffers, &index, 0);
     }
+    s_encoded_buffer = heap_caps_malloc(STREAM_FRAME_BYTES,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ESP_RETURN_ON_FALSE(s_encoded_buffer, ESP_ERR_NO_MEM, TAG,
+                        "allocate compressed update buffer");
     return ESP_OK;
 }
 
@@ -314,54 +339,75 @@ static bool receive_exact(int socket_fd, uint8_t *destination, size_t size,
     return true;
 }
 
-static bool receive_exact_frame(int socket_fd, uint8_t *destination)
-{
-    return receive_exact(socket_fd, destination, STREAM_FRAME_BYTES, true);
-}
-
 static uint8_t acquire_receive_buffer(void)
 {
     uint8_t index;
-    if (xQueueReceive(s_free_buffers, &index, 0) == pdTRUE) {
-        return index;
-    }
-    if (xQueueReceive(s_ready_frames, &index, 0) == pdTRUE) {
-        ++s_dropped_frames;
-        return index;
-    }
     xQueueReceive(s_free_buffers, &index, portMAX_DELAY);
     return index;
 }
 
-static void queue_completed_frame(uint8_t index)
+static void queue_completed_update(const ready_update_t *update)
 {
-    uint8_t stale_index;
-    if (xQueueReceive(s_ready_frames, &stale_index, 0) == pdTRUE) {
-        ++s_dropped_frames;
-        xQueueSend(s_free_buffers, &stale_index, portMAX_DELAY);
+    xQueueSend(s_ready_frames, update, portMAX_DELAY);
+}
+
+static bool decode_rgb565_rle(const uint8_t *source, size_t source_size,
+                              uint8_t *destination, size_t destination_size)
+{
+    size_t source_offset = 0;
+    size_t destination_offset = 0;
+    while (source_offset < source_size &&
+           destination_offset < destination_size) {
+        uint8_t token = source[source_offset++];
+        size_t pixel_count = (size_t)(token & 0x7f) + 1;
+        size_t byte_count = pixel_count * sizeof(uint16_t);
+        if (destination_offset + byte_count > destination_size) {
+            return false;
+        }
+        if ((token & 0x80) != 0) {
+            if (source_offset + sizeof(uint16_t) > source_size) {
+                return false;
+            }
+            uint8_t low = source[source_offset++];
+            uint8_t high = source[source_offset++];
+            for (size_t pixel = 0; pixel < pixel_count; ++pixel) {
+                destination[destination_offset++] = low;
+                destination[destination_offset++] = high;
+            }
+        } else {
+            if (source_offset + byte_count > source_size) {
+                return false;
+            }
+            memcpy(destination + destination_offset,
+                   source + source_offset, byte_count);
+            source_offset += byte_count;
+            destination_offset += byte_count;
+        }
     }
-    xQueueSend(s_ready_frames, &index, portMAX_DELAY);
+    return source_offset == source_size &&
+           destination_offset == destination_size;
 }
 
 static void display_task(void *argument)
 {
     (void)argument;
     while (true) {
-        uint8_t index;
-        if (xQueueReceive(s_ready_frames, &index, portMAX_DELAY) != pdTRUE) {
+        ready_update_t update;
+        if (xQueueReceive(s_ready_frames, &update, portMAX_DELAY) != pdTRUE) {
             continue;
         }
         int64_t start = esp_timer_get_time();
-        esp_err_t err = box2_lcd_draw_bitmap(0, 0, STREAM_WIDTH,
-                                             STREAM_HEIGHT,
-                                             (uint16_t *)s_frame_buffers[index]);
+        esp_err_t err = box2_lcd_draw_bitmap(
+            update.x, update.y, update.x + update.width,
+            update.y + update.height,
+            (uint16_t *)s_frame_buffers[update.buffer_index]);
         s_display_time_us += (uint64_t)(esp_timer_get_time() - start);
         if (err == ESP_OK) {
             ++s_displayed_frames;
         } else {
             ESP_LOGE(TAG, "LCD frame failed: %s", esp_err_to_name(err));
         }
-        xQueueSend(s_free_buffers, &index, portMAX_DELAY);
+        xQueueSend(s_free_buffers, &update.buffer_index, portMAX_DELAY);
     }
 }
 
@@ -461,7 +507,7 @@ static void stream_server_task(void *argument)
         bool valid_hello = receive_exact(client_fd, (uint8_t *)&hello,
                                          sizeof(hello), false) &&
                            memcmp(hello.magic, "B2DS", 4) == 0 &&
-                           ntohs(hello.version) == 1 &&
+                           ntohs(hello.version) == 2 &&
                            ntohs(hello.width) == STREAM_WIDTH &&
                            ntohs(hello.height) == STREAM_HEIGHT &&
                            ntohs(hello.pixel_format) == 1;
@@ -474,7 +520,7 @@ static void stream_server_task(void *argument)
 
         stream_ack_t ack = {
             .magic = {'B', '2', 'D', 'A'},
-            .version = htons(1),
+            .version = htons(2),
             .status = htons(0),
         };
         if (send(client_fd, &ack, sizeof(ack), 0) != sizeof(ack)) {
@@ -488,13 +534,56 @@ static void stream_server_task(void *argument)
         ESP_LOGI(TAG, "BOX-2 stream handshake accepted");
 
         while (true) {
+            frame_update_header_t header;
+            if (!receive_exact(client_fd, (uint8_t *)&header,
+                               sizeof(header), false)) {
+                break;
+            }
+            uint16_t x = ntohs(header.x);
+            uint16_t y = ntohs(header.y);
+            uint16_t width = ntohs(header.width);
+            uint16_t height = ntohs(header.height);
+            uint32_t payload_field = ntohl(header.payload_bytes);
+            bool is_rle = (payload_field & STREAM_PAYLOAD_RLE_FLAG) != 0;
+            uint32_t payload_bytes = payload_field & STREAM_PAYLOAD_SIZE_MASK;
+            uint32_t decoded_bytes =
+                (uint32_t)width * height * sizeof(uint16_t);
+            bool valid_update = memcmp(header.magic, "B2F2", 4) == 0 &&
+                                width > 0 && height > 0 &&
+                                x + width <= STREAM_WIDTH &&
+                                y + height <= STREAM_HEIGHT &&
+                                payload_bytes > 0 &&
+                                payload_bytes <= STREAM_FRAME_BYTES &&
+                                (is_rle || payload_bytes == decoded_bytes);
+            if (!valid_update) {
+                ESP_LOGW(TAG, "Rejected invalid frame update");
+                break;
+            }
+
             uint8_t index = acquire_receive_buffer();
-            if (!receive_exact_frame(client_fd, s_frame_buffers[index])) {
+            uint8_t *receive_buffer =
+                is_rle ? s_encoded_buffer : s_frame_buffers[index];
+            if (!receive_exact(client_fd, receive_buffer,
+                               payload_bytes, true)) {
                 xQueueSend(s_free_buffers, &index, portMAX_DELAY);
                 break;
             }
+            if (is_rle &&
+                !decode_rgb565_rle(s_encoded_buffer, payload_bytes,
+                                   s_frame_buffers[index], decoded_bytes)) {
+                ESP_LOGW(TAG, "Rejected invalid RGB565 RLE payload");
+                xQueueSend(s_free_buffers, &index, portMAX_DELAY);
+                break;
+            }
+            ready_update_t update = {
+                .buffer_index = index,
+                .x = x,
+                .y = y,
+                .width = width,
+                .height = height,
+            };
             ++s_received_frames;
-            queue_completed_frame(index);
+            queue_completed_update(&update);
         }
 
         ESP_LOGI(TAG, "Stream client disconnected");

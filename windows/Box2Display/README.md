@@ -4,9 +4,9 @@ This project turns the BOX-2 LCD into a Windows 11 extended display. The
 indirect display driver exposes one landscape `480 x 360 @ 30 Hz` monitor. The
 elevated host process captures that monitor, scales it to the LCD's native
 `320 x 240` resolution using high-quality downscaling, converts BGRA8 to
-RGB565 little-endian, and streams it
-over Wi-Fi. Only landscape mode is exposed. The host also draws an enlarged
-cursor and a high-contrast hot-spot ring into the transmitted image.
+RGB565 little-endian, and streams it over Wi-Fi. Only landscape mode is
+exposed. The host also draws an enlarged native cursor into the transmitted
+image.
 
 USB serial is used only for firmware flashing and diagnostics. Display pixels
 travel over TCP port 5000. The host first broadcasts a discovery request on UDP
@@ -45,12 +45,15 @@ To remove the display, driver, firewall rule, and logon task:
 
 ## Transport
 
-Each physical frame is exactly 153600 bytes (`320 * 240 * RGB565LE`). The ESP32
-receiver uses three PSRAM frame buffers and a latest-frame queue, so congestion
-drops stale images instead of accumulating latency. The target transmission
-rate is 15 FPS; the Windows virtual mode remains 30 Hz for normal desktop
-composition.
+Protocol version 2 starts with a full `320 * 240 * RGB565LE` key frame. Later
+updates contain only the changed bounding rectangle. An unchanged desktop sends
+no pixel payload, while ordinary cursor movement usually refreshes only a small
+region. Large animation or scrolling automatically falls back to a full-screen
+rectangle. Each rectangle uses lossless RGB565 run-length encoding when that is
+smaller than its raw pixels, and automatically falls back to raw RGB565 for
+photos or video.
 
-The current uncompressed stream requires about 18.4 Mbit/s at 15 FPS, excluding
-TCP/IP overhead. Future versions can add dirty rectangles or lightweight image
-compression without changing the Windows virtual-monitor interface.
+The host captures at up to 30 FPS. The ESP32 uses three PSRAM update buffers and
+applies every rectangle in order, preventing partial updates from being lost.
+This reduces typical bandwidth and LCD writes by an order of magnitude compared
+with continuously sending 153600-byte full frames.
