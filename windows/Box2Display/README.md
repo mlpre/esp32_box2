@@ -1,28 +1,21 @@
-# BOX-2 Wi-Fi Display
+# BOX-2 Windows Wi-Fi 显示驱动
 
-This project turns the BOX-2 LCD into a Windows 11 extended display. The
-indirect display driver exposes one landscape `480 x 360 @ 30 Hz` monitor. The
-elevated host process captures that monitor, scales it to the LCD's native
-`320 x 240` resolution using high-quality downscaling, encodes every frame as
-JPEG quality 80, and streams the MJPEG frames over Wi-Fi. Only landscape mode
-is exposed. The host also draws an enlarged native cursor into the transmitted
-image before encoding.
+本目录包含 BOX-2 Wi-Fi 扩展屏的 Windows 11 x64 主机程序和间接显示驱动。完整的固件构建、首次配网、驱动安装和故障排查说明请查看[项目根目录说明](../../README.md)。
 
-USB serial is used only for firmware flashing and diagnostics. Display pixels
-travel over UDP port 5000. The host first broadcasts a discovery request on UDP
-port 5001 and falls back to directed broadcasts on the PC's local `/24`
-networks. A versioned `B2DS`/`B2DA` datagram handshake prevents sending video
-to an unrelated UDP service.
+驱动会创建一个固定为 480×360、30 Hz、横屏模式的虚拟显示器。主机程序抓取该显示器，将画面高质量缩放到 BOX-2 LCD 的原生 320×240 分辨率，以质量 80 编码为 JPEG，并通过 Wi-Fi 发送。发送前还会把放大的系统鼠标指针合成到画面中。
 
-## Build and install
+USB 串口只用于 ESP32 固件烧录、配网和诊断；显示画面通过 UDP 5000 传输，设备自动发现使用 UDP 5001。
 
-Requirements:
+## 环境要求
 
 - Windows 11 x64
-- Visual Studio 2022 Build Tools with the C++ workload
-- Windows Driver Kit 10.0.26100 or newer
+- Visual Studio 2022 Build Tools
+- “使用 C++ 的桌面开发”工作负载及 v143 工具集
+- Windows Driver Kit 10.0.26100 或更高版本
 
-Run from an ordinary PowerShell window:
+## 构建和安装
+
+在普通 PowerShell 中进入本目录并执行：
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
@@ -30,45 +23,31 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\install.ps1
 ```
 
-`install.ps1` requests administrator permission, trusts the local development
-certificate, installs the driver package, adds the firewall rule, and creates
-the elevated `Box2DisplayHost` logon task. Select **Extend these displays** in
-Windows Settings if Windows does not choose it automatically.
+`build.ps1` 会编译主机程序和驱动、生成驱动目录文件，并使用本机自签名开发证书签名。输出位于 `out` 目录。
 
-The local certificate is suitable for development on this PC. Public
-distribution requires Microsoft driver signing.
+`install.ps1` 会请求管理员权限，然后信任开发证书、安装显示驱动、复制主机程序、添加防火墙规则，并创建和启动 `Box2DisplayHost` 登录计划任务。
 
-To remove the display, driver, firewall rule, and logon task:
+安装完成后打开“设置 → 系统 → 显示”。如果 Windows 没有自动选择扩展模式，请手动选择“扩展这些显示器”。
+
+本地自签名证书仅适用于开发和本机测试。公开分发需要符合 Microsoft 要求的正式驱动签名。
+
+## 卸载
 
 ```powershell
 .\uninstall.ps1
 ```
 
-## Transport
+卸载脚本会请求管理员权限，并删除虚拟显示设备、驱动包、防火墙规则、登录计划任务和已安装的主机程序。它不会自动删除主题为 `BOX-2 Display Development` 的开发证书。
 
-Protocol version 4 splits each baseline JPEG image into UDP datagrams on port
-5000. Each datagram stays below the normal Ethernet MTU: a 24-byte header and
-at most 1400 JPEG bytes. Its header carries the frame size and sequence plus the
-fragment index, count, offset, and payload length. UDP port 5001 remains
-responsible for discovery.
+## 传输方式
 
-The host captures and encodes at up to 30 FPS. The ESP32 decodes each JPEG
-directly to RGB565 little-endian in an aligned PSRAM buffer, keeps only the
-latest completed frame waiting for the LCD, and drops stale completed frames
-instead of accumulating display latency. The Windows host reuses its GDI
-capture surface and JPEG memory stream, and runs UDP transmission on a separate
-thread backed by a single latest-frame slot. The ESP32 decodes only fully
-reassembled JPEG frames. If any fragment is missing, that frame is discarded as
-soon as a newer sequence arrives, so packet loss produces a skipped frame rather
-than partial-image artifacts or retransmission latency. A one-second session
-keepalive lets streaming recover automatically after an ESP32 reboot or a brief
-Wi-Fi interruption, without waiting for a UDP disconnect event that does not
-exist.
+协议版本 4 将每张基线 JPEG 图片拆成 UDP 数据报。每个数据报包含 24 字节头部和最多 1400 字节 JPEG 数据，头部记录帧长度、帧序号、分片编号、分片总数、偏移量和数据长度。
 
-## Power button
+主机最高以 30 帧每秒抓屏和编码。ESP32 只解码完整重组的帧，并只保留等待显示的最新完整帧。分片丢失时直接跳过该帧，不进行重传，从而避免显示延迟持续增加。一秒一次的会话保活可让串流在 ESP32 重启或 Wi-Fi 短暂中断后自动恢复。
 
-Hold the middle **M** key for 1.5 seconds. On battery power this turns off the
-LCD and releases the board's `SYS_POW` latch for a real hardware shutdown. Hold
-the same key to power the board on again. USB supplies the board independently,
-so while USB is attached the same long press enters display standby instead;
-press **M** once to wake the display and resume decoding the newest frame.
+## M 键电源操作
+
+长按中间 M 键 1.5 秒：
+
+- 电池供电时，关闭 LCD 并释放 `SYS_POW` 电源锁存，实现硬件关机；再次长按 M 键开机。
+- USB 供电时，进入显示待机；短按一次 M 键即可唤醒并恢复最新画面。
