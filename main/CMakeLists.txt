@@ -1,3 +1,4 @@
+if(BOX2_HARDWARE_TEST)
 idf_component_register(
     SRCS
         "main.c"
@@ -12,3 +13,11 @@ idf_component_register(
         nvs_flash
         spi_flash
 )
+else()
+idf_component_register(
+    SRCS "game_main.c" "game.c" "game_render.c" "game_selftest.c"
+    INCLUDE_DIRS "."
+    PRIV_REQUIRES driver esp_timer nvs_flash
+    EMBED_FILES "assets/bgm.pcm" "assets/voice.pcm"
+)
+endif()
