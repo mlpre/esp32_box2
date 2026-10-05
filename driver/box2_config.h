@@ -11,11 +11,12 @@
 #define BOX2_ES8389_ADDR_8BIT 0x20
 #define BOX2_TCA9555_ADDR 0x20
 #define BOX2_SC7A20_ADDR 0x19
+// Physical keys from left to right: Q (back), L (left), M, R (right).
+#define BOX2_XIO_KEY_Q (1U << 6) // Back arrow.
+#define BOX2_XIO_KEY_L (1U << 5) // Left arrow.
+#define BOX2_XIO_KEY_M (1U << 7)
 #define BOX2_BUTTON_RIGHT GPIO_NUM_0
 #define BOX2_TCA9555_INT GPIO_NUM_2
-#define BOX2_XIO_KEY_L (1U << 5)
-#define BOX2_XIO_KEY_Q (1U << 6)
-#define BOX2_XIO_KEY_M (1U << 7)
 #define BOX2_XIO_USB_SEL (1U << 8)
 #define BOX2_XIO_SPK_EN (1U << 9)
 #define BOX2_XIO_SYS_POW (1U << 10)

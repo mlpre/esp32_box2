@@ -145,9 +145,9 @@ static void update_screen(bool lcd_ok, bool audio_ok, bool board_ok,
     snprintf(text[6], sizeof(text[6]), "SSID %.31s", s_wifi.strongest_ssid);
     snprintf(text[7], sizeof(text[7]), "BAT %dMV %d%% %s ADC=%d", board->battery_mv_estimate,
              board->battery_percent, board->charging ? "USB" : "BAT", board->battery_raw);
-    snprintf(text[8], sizeof(text[8]), "KEY L%d Q%d M%d R%d RAW=%d%d%d%d", board->left_pressed,
-             board->q_pressed, board->middle_pressed, board->right_pressed,
-             board->left_level, board->q_level, board->middle_level, board->right_level);
+    snprintf(text[8], sizeof(text[8]), "KEY Q%d L%d M%d R%d RAW=%d%d%d%d", board->q_pressed,
+             board->left_pressed, board->middle_pressed, board->right_pressed,
+             board->q_level, board->left_level, board->middle_level, board->right_level);
     snprintf(text[9], sizeof(text[9]), "ACC %s ID=%02X ORI=%s",
              motion->detected ? "OK" : "FAIL", motion->who_am_i,
              motion->orientation ? motion->orientation : "NONE");
@@ -161,7 +161,7 @@ static void update_screen(bool lcd_ok, bool audio_ok, bool board_ok,
     snprintf(text[14], sizeof(text[14]), "SD CAP=%" PRIu32 "M FAT=%" PRIu32 "M FREE=%" PRIu32 "M",
              storage->capacity_mb, storage->total_mb, storage->free_mb);
     snprintf(text[15], sizeof(text[15]), "SD SPI S17 MO16 MI18 CS15 25M");
-    snprintf(text[16], sizeof(text[16]), "TONE L440 Q660 M880 R1040");
+    snprintf(text[16], sizeof(text[16]), "TONE Q660 L440 M880 R1040 Q=BACK");
     int meter = mic_peak * 100 / 6000;
     if (meter > 100)
         meter = 100;
@@ -233,16 +233,17 @@ void app_main(void)
     }
     bool wifi_ok = wifi_test_init() == ESP_OK && wifi_test_scan() == ESP_OK;
     ESP_LOGI(TAG, "Wi-Fi radio test: %s", wifi_ok ? "PASS" : "FAIL");
+    bool previous_q = board_state.q_pressed;
     bool previous_left = false;
     bool previous_middle = false;
     bool previous_right = false;
-    bool previous_q = board_state.q_pressed;
     TickType_t last_screen = 0;
     TickType_t last_battery = 0;
     TickType_t last_motion = 0;
     TickType_t last_log = 0;
     int mic_peak = 0;
-    ESP_LOGI(TAG, "Interactive mode: L=440Hz, Q=660Hz, M=880Hz, R=1040Hz");
+    ESP_LOGI(TAG, "Interactive mode (left to right): Q(BACK)=660Hz, L(LEFT)=440Hz, "
+                  "M=880Hz, R(RIGHT)=1040Hz");
     while (true)
     {
         TickType_t now = xTaskGetTickCount();
@@ -272,30 +273,30 @@ void app_main(void)
         {
             vTaskDelay(pdMS_TO_TICKS(10));
         }
+        if (board_state.q_pressed && !previous_q && audio_ok)
+        {
+            ESP_LOGI(TAG, "BACK(Q) key: speaker 660 Hz");
+            ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_audio_play_tone(660, 180));
+        }
         if (board_state.left_pressed && !previous_left && audio_ok)
         {
-            ESP_LOGI(TAG, "LEFT key: speaker 440 Hz");
+            ESP_LOGI(TAG, "LEFT(L) key: speaker 440 Hz");
             ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_audio_play_tone(440, 180));
         }
         if (board_state.middle_pressed && !previous_middle && audio_ok)
         {
-            ESP_LOGI(TAG, "MIDDLE key: speaker 880 Hz");
+            ESP_LOGI(TAG, "MIDDLE(M) key: speaker 880 Hz");
             ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_audio_play_tone(880, 180));
-        }
-        if (board_state.q_pressed && !previous_q && audio_ok)
-        {
-            ESP_LOGI(TAG, "Q key: speaker 660 Hz");
-            ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_audio_play_tone(660, 180));
         }
         if (board_state.right_pressed && !previous_right && audio_ok)
         {
-            ESP_LOGI(TAG, "RIGHT key: speaker 1040 Hz");
+            ESP_LOGI(TAG, "RIGHT(R) key: speaker 1040 Hz");
             ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_audio_play_tone(1040, 180));
         }
+        previous_q = board_state.q_pressed;
         previous_left = board_state.left_pressed;
         previous_middle = board_state.middle_pressed;
         previous_right = board_state.right_pressed;
-        previous_q = board_state.q_pressed;
         if ((now - last_screen) >= pdMS_TO_TICKS(400))
         {
             update_screen(lcd_ok, audio_ok, board_ok, flash_mb, psram_mb,
@@ -305,11 +306,11 @@ void app_main(void)
         if ((now - last_log) >= pdMS_TO_TICKS(2000))
         {
             last_log = now;
-            ESP_LOGI(TAG, "mic=%5d keys=L%d Q%d M%d R%d raw=%d%d%d%d battery=%d%% "
+            ESP_LOGI(TAG, "mic=%5d keys=Q%d L%d M%d R%d raw=%d%d%d%d battery=%d%% "
                           "xio=0x%04X acc=%+d,%+d,%+dmg orient=%s sd=%s rw=%s",
-                     mic_peak, board_state.left_pressed, board_state.q_pressed,
+                     mic_peak, board_state.q_pressed, board_state.left_pressed,
                      board_state.middle_pressed, board_state.right_pressed,
-                     board_state.left_level, board_state.q_level,
+                     board_state.q_level, board_state.left_level,
                      board_state.middle_level, board_state.right_level,
                      board_state.battery_percent, board_state.xio, motion_state.x_mg,
                      motion_state.y_mg, motion_state.z_mg,

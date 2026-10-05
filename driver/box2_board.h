@@ -11,12 +11,13 @@ typedef struct
     int battery_percent;
     int battery_mv_estimate;
     bool charging;
-    bool left_pressed;
+    // Physical order: q (back arrow), left (left arrow), middle (M), right (right arrow).
     bool q_pressed;
+    bool left_pressed;
     bool middle_pressed;
     bool right_pressed;
-    bool left_level;
     bool q_level;
+    bool left_level;
     bool middle_level;
     bool right_level;
     bool expander_outputs_ok;
