@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
+// Initializes the panel with backlight off; draw a frame before enabling it.
 esp_err_t box2_lcd_init(void);
 esp_err_t box2_lcd_set_backlight(uint8_t percent);
 esp_err_t box2_lcd_draw_bitmap(int x_start, int y_start, int x_end, int y_end,

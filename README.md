@@ -1,234 +1,121 @@
-# ATK-DNESP32S3-BOX2-WIFI 通用驱动与硬件测试
+# ATK-DNESP32S3-BOX2-WIFI USB 麦克风
 
-工程分为根目录下可复用的 ESP-IDF 驱动组件 `driver` 和独立的硬件测试应用 `main`，适配
-`xiaozhi-esp32` PR #954 中的 `ATK-DNESP32S3-BOX2-WIFI`。驱动不依赖测试面板、提示音、
-Wi-Fi 扫描或临时测试文件，可以直接复制到其他 ESP-IDF 工程使用。
+同一份固件提供 **USB 麦克风** 和 **普通 USB Serial/JTAG 串口** 两种模式，
+适配 ESP32-S3 BOX2 WIFI、ES8389 麦克风和 240×320 显示屏。
+通用硬件驱动放在 `driver`，应用与 USB 代码放在 `main`。
 
-## 驱动库调用
+应用使用独立的中文日常界面：麦克风页显示连接、录音、静音、电平、增益和电量；
+串口页显示连接状态和模式切换提示。
 
-将 `driver` 复制到目标工程根目录，并通过 `EXTRA_COMPONENT_DIRS` 注册；在应用组件的
-`CMakeLists.txt` 中加入 `PRIV_REQUIRES driver`，然后通过聚合头文件调用：
+## 按键
 
-```c
-#include "box2.h"
+| 状态 | 操作 | 功能 |
+|---|---|---|
+| 开机，两种模式 | Q 长按 2 秒后松开 | 保存模式，重启切换麦克风 / 普通串口 |
+| 开机，两种模式 | M 长按 2 秒后松开 | 关机；屏幕显示长按进度和松开提示 |
+| 关机 / USB 待机 | M 短按后松开 | 开机，恢复之前保存的 USB 模式 |
+| 麦克风模式 | M 短按后松开 | 切换本地静音 |
+| 麦克风模式 | L / R 短按 | 输入增益降低 / 提高 3 dB |
 
-ESP_ERROR_CHECK(box2_board_init());
-ESP_ERROR_CHECK(box2_motion_init(box2_board_i2c_bus()));
+长按 M 不会同时触发短按静音；关机手势松开也不会立即唤醒。
+Q 和 M 均去抖，完成长按后等待按键稳定松开，避免重启时仍按住按键。
+开机按住 M 的首次手势会被忽略，松开后再进行正常操作。
+上电时请松开 Q/L/R，这三个按键仍会标定空闲电平；M 使用原板规定的高电平有效逻辑。
 
-box2_motion_state_t motion = {0};
-ESP_ERROR_CHECK(box2_motion_read(&motion));
+首次烧录且 NVS 没有模式记录时，默认进入 **普通串口模式**。
+模式保存在 NVS，断电和 M 开关机后保留。增益默认 30 dB，范围 0～42 dB；
+本地静音和增益在重新开机时恢复默认值。
+
+## 关机与外部供电
+
+固件在松开 M 后停止 USB 音频采集、断开电脑 USB 设备、关闭背光和扬声器，
+停止电池采样，再按原板顺序将 CHG_CTRL 拉低、释放 SYS_POW 电源锁存。
+
+电池供电使用板上的硬件断电路径，再次按 M 由硬件启动。
+**插着 USB 时，外部电源可能继续供电**：若 CPU 仍在运行，固件进入黑屏、
+USB 已断开的软件待机，只处理下一次短按 M；随后重新锁存供电并重启到已保存模式。
+这是功能待机，没有进入 ESP 深度睡眠，也不能让电脑的 USB 供电线路物理断电。
+
+固件不使用充电状态 CHRG 判断能否关机，因为充满电后该信号不能代表 USB 是否拔出。
+关机期间不采电池，避免电池采样重新配置 CHG_CTRL、影响电源锁存。
+
+## USB 麦克风使用
+
+1. 用支持数据传输的 USB 线连接设备和电脑。
+2. 在串口模式长按 Q 2 秒，看到松开提示后松开。
+3. 在 Windows 声音设置中选择输入设备 `BOX2 Microphone`。
+4. 打开录音程序，屏幕从“准备就绪”变为“正在录音”，电平条开始更新。
+5. 短按 M 静音，L/R 调整增益；长按 Q 后松开返回普通串口。
+
+录音格式固定 **48 kHz / 16 bit / 单声道**。使用 ES8389 左路麦克风输入，
+连续去除直流偏置，通过 UAC 采集任务、双缓冲和 TinyUSB FIFO 传给电脑。
+没有第二个 PCM 消费者；屏幕和电池采样不在 USB 采集任务中执行。
+
+只有电脑打开录音流后才采集。关闭录音或断开连接后，界面停止显示旧电平。
+静音时继续向电脑发送零值，本地静音与电脑静音共同生效；
+短按 M 不会解除电脑设置的静音。USB 控制仅提供主声道静音，增益通过实体键调整。
+
+串口模式保留日志、命令、下载和调试功能，发送文本命令即可：
+
+```text
+usb mic       保存麦克风模式并重启
+usb serial    保持普通串口模式
+usb status    查看当前模式
+help          查看命令说明
 ```
 
-公开接口按硬件拆分：
+支持 CR、LF、CRLF 换行。关机阶段禁用并丢弃串口命令。
+麦克风模式没有 COM 端口，返回串口使用 Q 键。
 
-- `box2_board_*`：共享 I2C、TCA9555、按键和电池状态
-- `box2_audio_*`：PCM 采集/播放、输出音量和输入增益
-- `box2_lcd_*`：LCD 初始化、背光和 RGB565 位图绘制
-- `box2_motion_*`：SC7A20 初始化和三轴采样
-- `box2_storage_*`：TF 卡挂载、容量刷新、挂载点和卸载
+两种模式共用 S3 的内部 USB PHY，退出麦克风和启动时显式恢复串口通路；
+不需要修改 eFuse。麦克风发生 panic 或看门狗复位时，固件尝试恢复串口模式，
+方便下载调试。普通 RESET、开机和正常切换保留所选模式。
 
-`main/hardware_test_utils.*` 中的提示音、麦克风峰值、SD 读写校验，以及
-`main/hardware_test_screen.*` 中的色条和测试面板，均属于测试层，不会链接进驱动库。
+## 构建与烧录
 
-## 已覆盖的硬件
-
-| 硬件 | 测试方式 |
-|---|---|
-| ESP32-S3 / 16 MB Flash / 8 MB OPI PSRAM | 启动时读取容量并显示 |
-| I2C（GPIO48/47） | 扫描总线，预期发现 ES8389 `0x10`、SC7A20 `0x19` 和 TCA9555 `0x20` |
-| TCA9555 扩展 IO | 配置并回读电源、扬声器、USB、按键和充电状态引脚 |
-| SC7A20 三轴加速度计 | 校验 ID `0x11`，配置 50 Hz 高精度模式，成组读取 X/Y/Z 并判断六个方向 |
-| ST7789 240×320 并口屏 | 显示 RGB 色条和实时测试面板 |
-| LCD 背光（GPIO21） | 启动时执行三档 PWM 亮度变化 |
-| ES8389 + I2S | 24 kHz 双工初始化、播放两段提示音、持续显示去除直流偏置后的麦克风峰值 |
-| Q/L/M/R 四个按键 | 按物理从左到右排列；上电自动标定空闲电平，同时显示按下状态和原始电平 |
-| 充电状态 | 显示 TCA9555 充电状态输入 |
-| 电池 ADC（GPIO1 / ADC1_CH0） | 每 5 秒采样，按上游 BOX2 标定表估算电压和电量 |
-| 2.4 GHz Wi-Fi | 主动扫描周围 AP，显示数量和最强信号，串口列出前 10 个 |
-| TF/MicroSD 卡 | SPI3 挂载 FAT 文件系统，显示卡名、容量、剩余空间并执行文件写入回读删除测试 |
-
-测试初始化时写入 `BOX2_XIO_SAFE_OUTPUTS`，保持 `SYS_POW` 电源锁存，并回读确认
-TCA9555 输出状态。
-
-显示使用 5×7 单倍点阵字体和 PSRAM 全屏帧缓冲，在 240×320 竖屏中同时显示 17 行
-硬件状态。测试面板和麦克风电平条每 400 ms 一起刷新。
-
-SC7A20、ES8389 和 TCA9555 共用 I2C 总线，7 位地址分别为 `0x19`、`0x10` 和 `0x20`。
-TF 卡使用 SPI3：SCLK GPIO17、MOSI GPIO16、MISO GPIO18、CS GPIO15，测试频率为
-25 MHz。TF 卡应在上电前插入，并使用 FAT/FAT32 文件系统；测试不会格式化卡，临时
-文件 `/sdcard/box2_test.tmp` 会在校验完成后自动删除。
-
-## 编译与烧录
-
-本工程仅使用 ESP-IDF 6.0.2，并已完成完整编译验证。
-工程目标是 ESP32-S3 N16R8：16 MB Flash、8 MB OPI PSRAM，控制台使用 USB Serial/JTAG。
-`sdkconfig.defaults` 已将默认构建目标设为 `esp32s3`。
-
-### 1. 准备 ESP-IDF 环境
-
-打开已配置好 ESP-IDF 6.0.2 环境的 PowerShell，进入项目根目录，然后执行：
-
-```powershell
-idf.py --version
-```
-
-如果尚未配置环境，请先按照 ESP-IDF 安装说明启动对应版本的 PowerShell。成功后，
-`idf.py --version` 应显示 `ESP-IDF v6.0.2`。
-
-### 2. 首次配置和编译
-
-干净源码中没有 `sdkconfig`、`dependencies.lock`、`managed_components` 和 `build`，执行：
+使用 **ESP-IDF 6.0.2**，芯片 ESP32-S3，16 MB Flash，8 MB OPI PSRAM。
+应用固定依赖 `usb_device_uac 1.3.1`、`tinyusb 0.19.0~3` 和 `esp_codec_dev 1.6.2`。
 
 ```powershell
 idf.py build
+idf.py -p COMx flash
 ```
 
-构建过程会自动完成以下工作：
+将 `COMx` 替换为设备的实际串口号；烧录前用 Q 切回普通串口模式。
+首次烧录使用 `flash` 写入引导程序、分区表和应用；后续应用更新可使用 `app-flash`。
 
-1. 从 `sdkconfig.defaults` 选择 ESP32-S3 并生成 `sdkconfig`。
-2. 根据 `driver/idf_component.yml` 解析并下载 `espressif/esp_codec_dev`，同时生成 `dependencies.lock`。
-3. 在 `build` 中生成 Bootloader、分区表和应用固件。
+UAC 原始仅麦克风描述符声明了实际控制数组不支持的声道 1 控制。
+`main/usb_descriptors.c` 保留原许可并修正声明，构建只替换描述符源文件，
+不修改 `managed_components`。升级 USB 组件时需要核对控制回调和描述符。
 
-成功时最后会出现 `Project build complete`。主要输出为：
+`build/esp32_box2.bin` 是应用镜像，地址 `0x10000`。
+`build/esp32_box2_full.bin` 是包含引导程序、分区表和应用的合并镜像，地址 `0x0`。
+更新建议使用 `idf.py app-flash`，或将应用镜像写到 `0x10000`，以保留 NVS 和已保存模式。
+完整合并镜像从 `0x0` 连续写入，会覆盖 NVS 间隙，已保存模式将重置为默认串口。
 
-| 文件 | 烧录地址 | 作用 |
-|---|---:|---|
-| `build/bootloader/bootloader.bin` | `0x0` | 启动加载程序 |
-| `build/partition_table/partition-table.bin` | `0x8000` | Flash 分区表 |
-| `build/esp32_box2.bin` | `0x10000` | 测试应用程序 |
+## 故障恢复
 
-### 3. 查找串口并烧录
+若无法正常启动，用 BOOT（GPIO0 / 最右 R 键）配合 RESET 进入 ROM 下载模式后烧录。
+麦克风模式没有串口端口，正常更新时先长按 Q 后松开，返回普通串口模式。
 
-查看 Windows 串口：
+电脑端以 Windows 为目标。
 
-```powershell
-Get-PnpDevice -Class Ports | Format-Table Status,FriendlyName
-```
+## 驱动库
 
-将下面的 `COM7` 换成实际端口：
+`driver` 可复制到其他 ESP-IDF 工程，通过 `EXTRA_COMPONENT_DIRS` 注册，
+在应用 `PRIV_REQUIRES` 添加 `driver`，统一包含 `box2.h`。
 
-```powershell
-idf.py -p COM7 flash monitor
-```
+- `box2_board_*`：共享 I2C、TCA9555、按键、电池、电源锁存和扬声器开关。
+- `box2_audio_*`：PCM 采集/播放、输出音量、输入增益和采样率。
+- `box2_lcd_*`：LCD 初始化、背光和 RGB565 位图绘制。
+- `box2_motion_*`：SC7A20 初始化和三轴采样。
+- `box2_storage_*`：TF 卡挂载、容量查询和卸载。
 
-这个命令会自动按正确地址烧录三个镜像，然后打开串口日志。退出监视器按 `Ctrl+]`。
+正式界面使用 `main/device_screen.*`，按键手势使用 `main/device_controls.*`。
 
-如果无法自动进入下载模式，按住 BOOT、短按 RESET、松开 BOOT，再重新执行烧录命令。
-更换过分区布局或旧固件异常时，可以先完整擦除：
+ES8389、SC7A20、TCA9555 共用 I2C GPIO48/47，7 位地址为 `0x10`、`0x19`、`0x20`。
+USB 使用 S3 原生 GPIO19/20。LCD 使用 8 位 I80 总线，帧缓冲在 PSRAM。
+电池电量根据 BOX2 原板 ADC 标定表估算。
 
-```powershell
-idf.py -p COM7 erase-flash
-idf.py -p COM7 flash monitor
-```
-
-### 4. 生成可从 0x0 直接刷写的单文件
-
-普通 `idf.py build` 生成的是三个分区镜像。如果需要乐鑫 Flash Download Tool 或单文件备份，
-在构建成功后执行：
-
-```powershell
-esptool --chip esp32s3 merge-bin `
-  --flash-mode dio --flash-freq 80m --flash-size 16MB `
-  -o .\build\esp32_box2_full.bin `
-  0x0 .\build\bootloader\bootloader.bin `
-  0x8000 .\build\partition_table\partition-table.bin `
-  0x10000 .\build\esp32_box2.bin
-```
-
-生成的 `build/esp32_box2_full.bin` 应从地址 `0x0` 烧录。命令行直接写入示例：
-
-```powershell
-esptool --chip esp32s3 --port COM7 --baud 460800 write-flash `
-  --flash-mode dio --flash-freq 80m --flash-size 16MB `
-  0x0 .\build\esp32_box2_full.bin
-```
-
-### 5. 清理和重新构建
-
-删除普通编译结果：
-
-```powershell
-idf.py fullclean
-```
-
-需要完全回到干净源码状态时，还可以删除自动生成的 `build`、`managed_components`、
-`sdkconfig` 和 `dependencies.lock`；再次执行第 2 步即可恢复。不要删除
-`sdkconfig.defaults` 或 `driver/idf_component.yml`。
-
-## 上电现象和操作
-
-1. 背光从暗到亮变化，屏幕显示 RGB 色条。
-2. 扬声器播放两段提示音。
-3. 屏幕进入 17 行实时测试面板；串口打印 I2C、音频、Wi-Fi、电池、按键、加速度和 TF 卡详情。
-4. 对麦克风说话，底部绿色电平条应变化。
-5. 物理从左到右的 Q/L/M/R 键分别播放 660/440/880/1040 Hz。上电标定期间不要按住按键。
-6. 转动开发板，`ACC X/Y/Z` 和 `ORI` 应随姿态改变。
-7. 插有可写 TF 卡时，`SD OK`、`RW=OK`、容量和剩余空间应正常显示。
-
-实体按键已按实测确认，面向屏幕时从左到右的对应关系如下，每个键的提示音保持不变：
-
-| 物理位置 | 按键标识 | 软件名 | 输入引脚 | 提示音 |
-|---|---|---|---|---|
-| 第 1 个（最左） | 返回箭头 | Q | TCA9555 P0.6 | 660 Hz |
-| 第 2 个 | 左箭头 | L | TCA9555 P0.5 | 440 Hz |
-| 第 3 个 | M | M | TCA9555 P0.7 | 880 Hz |
-| 第 4 个（最右） | 右箭头 | R | ESP32 GPIO0 | 1040 Hz |
-
-屏幕面板和串口中的 `KEY`、`RAW` 均按物理从左到右的 Q/L/M/R 顺序输出。
-`KEY` 中的 `1` 表示按下；`RAW` 四位是 Q/L/M/R 的原始电平，应与松开时比较，
-不要假设空闲电平全为 `1`。上电时会自动标定空闲电平；如果启动时按住了某个键，
-请松开所有按键后重新启动。
-
-复验时，松开所有按键后重启，等待串口出现 `Interactive mode`，确认
-`KEY Q0 L0 M0 R0`。再从左到右逐键按住 3 秒、松开 2 秒，确认对应位置的
-`KEY` 变为 `1`、`RAW` 同一位翻转，松开后恢复；依次应为 Q、L、M、R。
-
-面板中的 `OK` 表示驱动调用和可回读状态正常。LCD 色彩、背光变化、扬声器声音、
-麦克风电平和实体按键仍需人工观察，这些项目无法仅靠固件自动判定。
-
-## 主要文件
-
-- `driver/*.h`：稳定的公开 API 和板级配置
-- `driver/*.c`：音频、板级 IO、LCD、运动和存储驱动实现
-- `main/hardware_test_utils.c`：提示音、麦克风峰值和 TF 卡读写测试
-- `main/hardware_test_screen.c`：测试专用色条和实时状态面板
-- `main/main.c`：启动自检、Wi-Fi 扫描和交互循环
-
-## 干净源码目录
-
-本工程交付时只保留下面这些源码和可复现配置：
-
-```text
-esp32_box2/
-├─ .gitignore
-├─ CMakeLists.txt
-├─ README.md
-├─ sdkconfig.defaults
-├─ driver/
-│  ├─ CMakeLists.txt
-│  ├─ idf_component.yml
-│  ├─ box2.h
-│  ├─ box2_config.h
-│  ├─ box2_board.c
-│  ├─ box2_board.h
-│  ├─ box2_audio.c
-│  ├─ box2_audio.h
-│  ├─ box2_motion.c
-│  ├─ box2_motion.h
-│  ├─ box2_storage.c
-│  ├─ box2_storage.h
-│  ├─ box2_lcd.c
-│  └─ box2_lcd.h
-└─ main/
-   ├─ CMakeLists.txt
-   ├─ main.c
-   ├─ hardware_test_utils.c
-   ├─ hardware_test_utils.h
-   ├─ hardware_test_screen.c
-   └─ hardware_test_screen.h
-```
-
-`build/`、`managed_components/`、`sdkconfig` 和 `dependencies.lock` 都是构建时自动生成的内容，
-不属于源码交付物。
-
-硬件定义来源：[xiaozhi-esp32 PR #954](https://github.com/78/xiaozhi-esp32/pull/954/changes)。
+电源锁存和 M 极性参考
+[BOX2 原板实现](https://github.com/78/xiaozhi-esp32/blob/main/main/boards/alientek/atk-dnesp32s3-box2-wifi/atk_dnesp32s3_box2.cc)。

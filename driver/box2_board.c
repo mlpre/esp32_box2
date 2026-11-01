@@ -5,6 +5,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #define TCA9555_REG_INPUT0 0x00
 #define TCA9555_REG_OUTPUT0 0x02
@@ -13,6 +14,10 @@ static const char *TAG = "box2_board";
 static i2c_master_bus_handle_t s_i2c_bus;
 static i2c_master_dev_handle_t s_tca9555;
 static adc_oneshot_unit_handle_t s_adc;
+static SemaphoreHandle_t s_output_mutex;
+static uint16_t s_output_shadow = BOX2_XIO_SAFE_OUTPUTS;
+static bool s_initialized;
+static bool s_power_off_requested;
 static int s_i2c_device_count;
 static bool s_key_q_idle;
 static bool s_key_l_idle;
@@ -104,35 +109,47 @@ static esp_err_t read_battery(int *raw)
     ESP_RETURN_ON_ERROR(tca_write_u16(TCA9555_REG_CONFIG0,
                                       BOX2_XIO_INPUT_MASK & ~BOX2_XIO_CHG_CTRL),
                         TAG, "enable battery divider");
-    ESP_RETURN_ON_ERROR(tca_write_u16(TCA9555_REG_OUTPUT0,
-                                      BOX2_XIO_SAFE_OUTPUTS & ~BOX2_XIO_CHG_CTRL),
-                        TAG, "drive battery divider");
-    vTaskDelay(pdMS_TO_TICKS(100));
+    // Caller holds s_output_mutex; keep speaker, USB routing and power latches.
+    esp_err_t err = tca_write_u16(TCA9555_REG_OUTPUT0,
+                                 s_output_shadow & ~BOX2_XIO_CHG_CTRL);
     int total = 0;
     int sample = 0;
-    esp_err_t err = ESP_OK;
-    for (int i = 0; i < 16; ++i)
+    if (err == ESP_OK)
     {
-        err = adc_oneshot_read(s_adc, BOX2_BATTERY_ADC_CHANNEL, &sample);
-        if (err != ESP_OK)
+        vTaskDelay(pdMS_TO_TICKS(100));
+        for (int i = 0; i < 16; ++i)
         {
-            break;
+            err = adc_oneshot_read(s_adc, BOX2_BATTERY_ADC_CHANNEL, &sample);
+            if (err != ESP_OK)
+            {
+                break;
+            }
+            total += sample;
         }
-        total += sample;
     }
-    esp_err_t restore_err = tca_write_u16(TCA9555_REG_CONFIG0, BOX2_XIO_INPUT_MASK);
-    if (err == ESP_OK && restore_err == ESP_OK)
+    // Restore the divider even if its output write or ADC sampling failed.
+    esp_err_t restore_config_err = tca_write_u16(TCA9555_REG_CONFIG0, BOX2_XIO_INPUT_MASK);
+    esp_err_t restore_output_err = tca_write_u16(TCA9555_REG_OUTPUT0, s_output_shadow);
+    if (err == ESP_OK && restore_config_err == ESP_OK && restore_output_err == ESP_OK)
     {
         *raw = total / 16;
         return ESP_OK;
     }
-    return err != ESP_OK ? err : restore_err;
+    return err != ESP_OK ? err :
+           (restore_config_err != ESP_OK ? restore_config_err : restore_output_err);
 }
 esp_err_t box2_board_init(void)
 {
-    if (s_i2c_bus)
+    if (s_initialized)
     {
         return ESP_OK;
+    }
+    ESP_RETURN_ON_FALSE(!s_i2c_bus, ESP_ERR_INVALID_STATE, TAG,
+                        "previous board initialization failed; restart required");
+    if (!s_output_mutex)
+    {
+        s_output_mutex = xSemaphoreCreateMutex();
+        ESP_RETURN_ON_FALSE(s_output_mutex, ESP_ERR_NO_MEM, TAG, "create expander mutex");
     }
     const i2c_master_bus_config_t bus_cfg = {
         .i2c_port = I2C_NUM_0,
@@ -152,7 +169,7 @@ esp_err_t box2_board_init(void)
     };
     ESP_RETURN_ON_ERROR(i2c_master_bus_add_device(s_i2c_bus, &tca_cfg, &s_tca9555),
                         TAG, "add TCA9555");
-    ESP_RETURN_ON_ERROR(tca_write_u16(TCA9555_REG_OUTPUT0, BOX2_XIO_SAFE_OUTPUTS),
+    ESP_RETURN_ON_ERROR(tca_write_u16(TCA9555_REG_OUTPUT0, s_output_shadow),
                         TAG, "set safe expander outputs");
     ESP_RETURN_ON_ERROR(tca_write_u16(TCA9555_REG_CONFIG0, BOX2_XIO_INPUT_MASK),
                         TAG, "configure expander directions");
@@ -167,7 +184,6 @@ esp_err_t box2_board_init(void)
     ESP_RETURN_ON_ERROR(gpio_config(&key_cfg), TAG, "configure keys");
     int q_high = 0;
     int l_high = 0;
-    int m_high = 0;
     int r_high = 0;
     for (int i = 0; i < 16; ++i)
     {
@@ -176,13 +192,15 @@ esp_err_t box2_board_init(void)
                             "calibrate key idle levels");
         q_high += (keys & BOX2_XIO_KEY_Q) != 0;
         l_high += (keys & BOX2_XIO_KEY_L) != 0;
-        m_high += (keys & BOX2_XIO_KEY_M) != 0;
         r_high += gpio_get_level(BOX2_BUTTON_RIGHT) != 0;
         vTaskDelay(pdMS_TO_TICKS(5));
     }
     s_key_q_idle = q_high >= 8;
     s_key_l_idle = l_high >= 8;
-    s_key_m_idle = m_high >= 8;
+    // The BOX2 reference button driver reads M/P7 without inversion: active high.
+    // M also starts the board, so it may be held throughout this calibration.
+    // Do not turn the startup power-button press into the M idle level.
+    s_key_m_idle = false;
     s_key_r_idle = r_high >= 8;
     ESP_LOGI(TAG, "key idle levels: Q(BACK/P6)=%d L(P5)=%d M(P7)=%d R(GPIO0)=%d",
              s_key_q_idle, s_key_l_idle, s_key_m_idle, s_key_r_idle);
@@ -198,6 +216,7 @@ esp_err_t box2_board_init(void)
     ESP_RETURN_ON_ERROR(adc_oneshot_config_channel(s_adc, BOX2_BATTERY_ADC_CHANNEL,
                                                    &adc_chan_cfg),
                         TAG, "configure battery ADC");
+    s_initialized = true;
     return ESP_OK;
 }
 i2c_master_bus_handle_t box2_board_i2c_bus(void)
@@ -229,9 +248,79 @@ esp_err_t box2_board_i2c_scan(uint8_t *addresses, size_t capacity, size_t *count
     s_i2c_device_count = (int)found;
     return found > capacity && addresses ? ESP_ERR_INVALID_SIZE : ESP_OK;
 }
-esp_err_t box2_board_read_state(box2_board_state_t *state, bool sample_battery)
+esp_err_t box2_board_set_speaker_enabled(bool enabled)
 {
-    ESP_RETURN_ON_FALSE(state, ESP_ERR_INVALID_ARG, TAG, "state is null");
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "board not initialized");
+    xSemaphoreTake(s_output_mutex, portMAX_DELAY);
+    if (enabled && s_power_off_requested)
+    {
+        xSemaphoreGive(s_output_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+    uint16_t desired = enabled ? s_output_shadow | BOX2_XIO_SPK_EN :
+                                s_output_shadow & ~BOX2_XIO_SPK_EN;
+    esp_err_t err = tca_write_u16(TCA9555_REG_OUTPUT0, desired);
+    if (err == ESP_OK)
+    {
+        s_output_shadow = desired;
+    }
+    xSemaphoreGive(s_output_mutex);
+    return err;
+}
+
+esp_err_t box2_board_power_off(void)
+{
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "board not initialized");
+    xSemaphoreTake(s_output_mutex, portMAX_DELAY);
+    // Stop battery measurements before changing CHG_CTRL. Keep them blocked on
+    // any partial failure too; power_on() restores the known working state.
+    s_power_off_requested = true;
+    const uint16_t prepared = s_output_shadow & ~BOX2_XIO_SPK_EN & ~BOX2_XIO_CHG_CTRL;
+    esp_err_t err = tca_write_u16(TCA9555_REG_OUTPUT0, prepared);
+    if (err == ESP_OK)
+    {
+        s_output_shadow = prepared;
+        err = tca_write_u16(TCA9555_REG_CONFIG0,
+                            BOX2_XIO_INPUT_MASK & ~BOX2_XIO_CHG_CTRL);
+    }
+    if (err == ESP_OK)
+    {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        const uint16_t off_outputs = s_output_shadow & ~BOX2_XIO_SYS_POW;
+        err = tca_write_u16(TCA9555_REG_OUTPUT0, off_outputs);
+        if (err == ESP_OK)
+        {
+            s_output_shadow = off_outputs;
+        }
+    }
+    xSemaphoreGive(s_output_mutex);
+    return err;
+}
+
+esp_err_t box2_board_power_on(void)
+{
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "board not initialized");
+    xSemaphoreTake(s_output_mutex, portMAX_DELAY);
+    // Latch system power first, before releasing the charge-control pin.
+    const uint16_t on_outputs = (s_output_shadow | BOX2_XIO_SYS_POW) & ~BOX2_XIO_CHG_CTRL;
+    esp_err_t err = tca_write_u16(TCA9555_REG_OUTPUT0, on_outputs);
+    if (err == ESP_OK)
+    {
+        s_output_shadow = on_outputs;
+        err = tca_write_u16(TCA9555_REG_CONFIG0, BOX2_XIO_INPUT_MASK);
+    }
+    if (err == ESP_OK)
+    {
+        s_power_off_requested = false;
+    }
+    xSemaphoreGive(s_output_mutex);
+    return err;
+}
+
+static esp_err_t read_state_locked(box2_board_state_t *state, bool sample_battery)
+{
+    ESP_RETURN_ON_FALSE(!sample_battery || !s_power_off_requested,
+                        ESP_ERR_INVALID_STATE, TAG, "battery sampling disabled during power-off");
     uint16_t xio = 0;
     ESP_RETURN_ON_ERROR(tca_read_u16(TCA9555_REG_INPUT0, &xio), TAG, "read expander");
     state->xio = xio;
@@ -245,7 +334,7 @@ esp_err_t box2_board_read_state(box2_board_state_t *state, bool sample_battery)
     state->middle_pressed = state->middle_level != s_key_m_idle;
     state->right_pressed = state->right_level != s_key_r_idle;
     state->expander_outputs_ok =
-        (xio & BOX2_XIO_OUTPUT_MASK) == (BOX2_XIO_SAFE_OUTPUTS & BOX2_XIO_OUTPUT_MASK);
+        (xio & BOX2_XIO_OUTPUT_MASK) == (s_output_shadow & BOX2_XIO_OUTPUT_MASK);
     if (sample_battery)
     {
         int raw = 0;
@@ -255,4 +344,14 @@ esp_err_t box2_board_read_state(box2_board_state_t *state, bool sample_battery)
         state->battery_mv_estimate = battery_mv_from_raw(raw);
     }
     return ESP_OK;
+}
+
+esp_err_t box2_board_read_state(box2_board_state_t *state, bool sample_battery)
+{
+    ESP_RETURN_ON_FALSE(state, ESP_ERR_INVALID_ARG, TAG, "state is null");
+    ESP_RETURN_ON_FALSE(s_initialized, ESP_ERR_INVALID_STATE, TAG, "board not initialized");
+    xSemaphoreTake(s_output_mutex, portMAX_DELAY);
+    esp_err_t err = read_state_locked(state, sample_battery);
+    xSemaphoreGive(s_output_mutex);
+    return err;
 }

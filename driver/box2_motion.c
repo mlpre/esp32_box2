@@ -66,7 +66,7 @@ esp_err_t box2_motion_init(i2c_master_bus_handle_t i2c_bus)
     ESP_RETURN_ON_ERROR(write_reg(SC7A20_REG_CTRL4, 0x88), TAG,
                         "configure high-resolution block update");
     ESP_RETURN_ON_ERROR(write_reg(SC7A20_REG_MISC, 0x08), TAG, "configure sensor");
-    ESP_LOGI(TAG, "SC7A20 PASS: address=0x%02X ID=0x%02X", BOX2_SC7A20_ADDR,
+    ESP_LOGI(TAG, "SC7A20 initialized: address=0x%02X ID=0x%02X", BOX2_SC7A20_ADDR,
              s_who_am_i);
     return ESP_OK;
 }

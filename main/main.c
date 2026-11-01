@@ -1,322 +1,349 @@
-#include <inttypes.h>
+#include <stdarg.h>
 #include <stdbool.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <stdint.h>
 #include "box2.h"
-#include "esp_chip_info.h"
-#include "esp_check.h"
-#include "esp_event.h"
-#include "esp_flash.h"
-#include "esp_heap_caps.h"
+#include "device_controls.h"
+#include "device_screen.h"
+#include "driver/usb_serial_jtag.h"
 #include "esp_log.h"
-#include "esp_netif.h"
-#include "esp_wifi.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "hardware_test_screen.h"
-#include "hardware_test_utils.h"
-#include "nvs_flash.h"
-static const char *TAG = "box2_demo";
+#include "tusb.h"
+#include "usb_microphone.h"
+#include "usb_mode.h"
+
+static const char *TAG = "box2";
+
 typedef struct
 {
-    bool initialized;
-    bool scan_ok;
-    uint16_t ap_count;
-    int8_t strongest_rssi;
-    char strongest_ssid[33];
-} wifi_test_state_t;
-static wifi_test_state_t s_wifi;
-static esp_err_t wifi_test_init(void)
+    bool raw;
+    bool pressed;
+    uint32_t changed_at;
+} button_filter_t;
+
+static uint32_t now_ms(void)
 {
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        ESP_RETURN_ON_ERROR(nvs_flash_erase(), TAG, "erase NVS");
-        err = nvs_flash_init();
-    }
-    ESP_RETURN_ON_ERROR(err, TAG, "initialize NVS");
-    ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "initialize network stack");
-    ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "create event loop");
-    wifi_init_config_t config = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_RETURN_ON_ERROR(esp_wifi_init(&config), TAG, "initialize Wi-Fi");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), TAG, "set Wi-Fi storage");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set station mode");
-    ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "start Wi-Fi");
-    s_wifi.initialized = true;
-    return ESP_OK;
+    return (uint32_t)(esp_timer_get_time() / 1000);
 }
-static esp_err_t wifi_test_scan(void)
+
+static bool filtered_button(button_filter_t *button, bool raw, uint32_t now)
 {
-    if (!s_wifi.initialized)
+    if (raw != button->raw)
     {
-        return ESP_ERR_INVALID_STATE;
+        button->raw = raw;
+        button->changed_at = now;
     }
-    const wifi_scan_config_t scan_config = {
-        .ssid = NULL,
-        .bssid = NULL,
-        .channel = 0,
-        .show_hidden = true,
-        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-        .scan_time.active = {
-            .min = 100,
-            .max = 250,
-        },
-        .home_chan_dwell_time = 30,
-    };
-    ESP_LOGI(TAG, "Scanning 2.4 GHz Wi-Fi...");
-    esp_err_t err = esp_wifi_scan_start(&scan_config, true);
-    if (err != ESP_OK)
+    if (button->pressed != raw && (uint32_t)(now - button->changed_at) >= 30)
     {
-        s_wifi.scan_ok = false;
-        return err;
+        button->pressed = raw;
     }
-    uint16_t count = 0;
-    ESP_RETURN_ON_ERROR(esp_wifi_scan_get_ap_num(&count), TAG, "get AP count");
-    uint16_t read_count = count > 24 ? 24 : count;
-    wifi_ap_record_t *records = calloc(read_count ? read_count : 1, sizeof(*records));
-    ESP_RETURN_ON_FALSE(records, ESP_ERR_NO_MEM, TAG, "allocate AP records");
-    err = esp_wifi_scan_get_ap_records(&read_count, records);
-    if (err == ESP_OK)
+    return button->pressed;
+}
+
+static int discard_usb_log(const char *format, va_list arguments)
+{
+    (void)format;
+    (void)arguments;
+    return 0;
+}
+
+static void enter_power_off(bool microphone, bool lcd_ok)
+{
+    usb_mode_set_commands_enabled(false);
+    if (lcd_ok)
     {
-        s_wifi.ap_count = count;
-        s_wifi.strongest_rssi = read_count ? records[0].rssi : -127;
-        snprintf(s_wifi.strongest_ssid, sizeof(s_wifi.strongest_ssid), "%s",
-                 read_count ? (const char *)records[0].ssid : "NONE");
-        s_wifi.scan_ok = true;
-        ESP_LOGI(TAG, "Wi-Fi scan PASS: %u AP(s), strongest '%s' (%d dBm)",
-                 count, s_wifi.strongest_ssid, s_wifi.strongest_rssi);
-        for (uint16_t i = 0; i < read_count && i < 10; ++i)
-        {
-            ESP_LOGI(TAG, "  %2u  ch=%2u  rssi=%4d  %s", i + 1, records[i].primary,
-                     records[i].rssi, records[i].ssid);
-        }
+        (void)device_screen_show_power_off();
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+    // Keep console writes away from the shared PHY while USB is detached.
+    esp_log_set_vprintf(discard_usb_log);
+    if (microphone)
+    {
+        usb_microphone_prepare_power_off();
     }
     else
     {
-        s_wifi.scan_ok = false;
+        usb_mode_disconnect_serial_phy();
     }
-    free(records);
-    return err;
-}
-static void print_system_info(uint32_t *flash_mb, uint32_t *psram_mb)
-{
-    esp_chip_info_t chip_info;
-    uint32_t flash_size = 0;
-    esp_chip_info(&chip_info);
-    ESP_ERROR_CHECK(esp_flash_get_size(NULL, &flash_size));
-    size_t psram_size = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
-    *flash_mb = flash_size / (1024 * 1024);
-    *psram_mb = (uint32_t)(psram_size / (1024 * 1024));
-    ESP_LOGI(TAG, "ATK-DNESP32S3-BOX2-WIFI hardware test");
-    ESP_LOGI(TAG, "chip=%s cores=%u rev=%u flash=%" PRIu32 "MB psram=%" PRIu32 "MB",
-             CONFIG_IDF_TARGET, chip_info.cores, chip_info.revision, *flash_mb, *psram_mb);
-}
-static void update_screen(bool lcd_ok, bool audio_ok, bool board_ok,
-                          uint32_t flash_mb, uint32_t psram_mb,
-                          const box2_board_state_t *board,
-                          const box2_motion_state_t *motion,
-                          const hardware_test_storage_result_t *storage_test,
-                          int mic_peak)
-{
-    if (!lcd_ok)
-    {
-        return;
-    }
-    char text[17][40];
-    const char *lines[17];
-    for (int i = 0; i < 17; ++i)
-    {
-        lines[i] = text[i];
-    }
-    snprintf(text[0], sizeof(text[0]), "SYS FLASH=%" PRIu32 "M PSRAM=%" PRIu32 "M CPU=240M",
-             flash_mb, psram_mb);
-    int i2c_count = box2_board_i2c_device_count();
-    bool i2c_ok = board_ok && i2c_count >= 3;
-    snprintf(text[1], sizeof(text[1]), "I2C %s N=%d ADDR=10,19,20", i2c_ok ? "OK" : "FAIL",
-             i2c_count);
-    snprintf(text[2], sizeof(text[2]), "XIO %s RAW=%04X SAFE=%s",
-             board->expander_outputs_ok ? "OK" : "FAIL", board->xio,
-             board->expander_outputs_ok ? "OK" : "FAIL");
-    snprintf(text[3], sizeof(text[3]), "LCD OK 240X320 I80 BL=PWM");
-    snprintf(text[4], sizeof(text[4]), "AUDIO %s MIC=%d %s", audio_ok ? "OK" : "FAIL",
-             mic_peak, audio_ok ? "LIVE" : "OFF");
-    snprintf(text[5], sizeof(text[5]), "WIFI %s AP=%u RSSI=%dDBM", s_wifi.scan_ok ? "OK" : "FAIL",
-             s_wifi.ap_count, s_wifi.strongest_rssi);
-    snprintf(text[6], sizeof(text[6]), "SSID %.31s", s_wifi.strongest_ssid);
-    snprintf(text[7], sizeof(text[7]), "BAT %dMV %d%% %s ADC=%d", board->battery_mv_estimate,
-             board->battery_percent, board->charging ? "USB" : "BAT", board->battery_raw);
-    snprintf(text[8], sizeof(text[8]), "KEY Q%d L%d M%d R%d RAW=%d%d%d%d", board->q_pressed,
-             board->left_pressed, board->middle_pressed, board->right_pressed,
-             board->q_level, board->left_level, board->middle_level, board->right_level);
-    snprintf(text[9], sizeof(text[9]), "ACC %s ID=%02X ORI=%s",
-             motion->detected ? "OK" : "FAIL", motion->who_am_i,
-             motion->orientation ? motion->orientation : "NONE");
-    snprintf(text[10], sizeof(text[10]), "ACC X=%+5dMG RAW=%+6d", motion->x_mg, motion->raw_x);
-    snprintf(text[11], sizeof(text[11]), "ACC Y=%+5dMG RAW=%+6d", motion->y_mg, motion->raw_y);
-    snprintf(text[12], sizeof(text[12]), "ACC Z=%+5dMG RAW=%+6d", motion->z_mg, motion->raw_z);
-    const box2_storage_state_t *storage = &storage_test->storage;
-    snprintf(text[13], sizeof(text[13]), "SD %s NAME=%s RW=%s",
-             storage->mounted ? "OK" : "NO CARD", storage->name[0] ? storage->name : "-",
-             storage_test->read_write_ok ? "OK" : "FAIL");
-    snprintf(text[14], sizeof(text[14]), "SD CAP=%" PRIu32 "M FAT=%" PRIu32 "M FREE=%" PRIu32 "M",
-             storage->capacity_mb, storage->total_mb, storage->free_mb);
-    snprintf(text[15], sizeof(text[15]), "SD SPI S17 MO16 MI18 CS15 25M");
-    snprintf(text[16], sizeof(text[16]), "TONE Q660 L440 M880 R1040 Q=BACK");
-    int meter = mic_peak * 100 / 6000;
-    if (meter > 100)
-        meter = 100;
-    esp_err_t err = hardware_test_screen_show_lines(
-        "BOX2 COMPLETE HARDWARE TEST", lines, 17, meter);
-    if (err != ESP_OK)
-    {
-        ESP_LOGW(TAG, "LCD refresh failed: %s", esp_err_to_name(err));
-    }
-}
-void app_main(void)
-{
-    uint32_t flash_mb = 0;
-    uint32_t psram_mb = 0;
-    print_system_info(&flash_mb, &psram_mb);
-    bool board_ok = box2_board_init() == ESP_OK;
-    size_t i2c_count = 0;
-    uint8_t i2c_addresses[16];
-    if (board_ok)
-    {
-        esp_err_t scan_err = box2_board_i2c_scan(i2c_addresses,
-                                                 sizeof(i2c_addresses), &i2c_count);
-        board_ok = scan_err == ESP_OK;
-        ESP_LOGI(TAG, "I2C scan found %u device(s)", (unsigned)i2c_count);
-        size_t listed_count = i2c_count < sizeof(i2c_addresses) ? i2c_count : sizeof(i2c_addresses);
-        for (size_t i = 0; i < listed_count; ++i)
-        {
-            ESP_LOGI(TAG, "  device @ 0x%02X", i2c_addresses[i]);
-        }
-    }
-    ESP_LOGI(TAG, "I2C/TCA9555 test: %s", board_ok ? "PASS" : "FAIL");
-    bool lcd_ok = box2_lcd_init() == ESP_OK;
-    ESP_LOGI(TAG, "LCD/backlight test: %s", lcd_ok ? "PASS" : "FAIL");
     if (lcd_ok)
     {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_lcd_set_backlight(13));
-        vTaskDelay(pdMS_TO_TICKS(120));
-        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_lcd_set_backlight(50));
-        vTaskDelay(pdMS_TO_TICKS(120));
-        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_lcd_set_backlight(100));
-        ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_screen_show_color_bars());
-        vTaskDelay(pdMS_TO_TICKS(900));
+        (void)box2_lcd_set_backlight(0);
     }
-    box2_board_state_t board_state = {0};
+    // Battery power normally disappears here. USB power can keep the CPU
+    // alive, so the caller also enters a dark, USB-disconnected standby loop.
+    // That fallback is functional standby, not an ESP deep-sleep mode.
+    (void)box2_board_power_off();
+}
+
+static void run_device(bool microphone, esp_err_t initial_error)
+{
+    if (microphone)
+    {
+        esp_log_set_vprintf(discard_usb_log);
+    }
+    const bool board_ok = box2_board_init() == ESP_OK;
     if (board_ok)
     {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(box2_board_read_state(&board_state, true));
-        ESP_LOGI(TAG, "battery raw=%d estimate=%d mV level=%d%% charging=%d",
-                 board_state.battery_raw, board_state.battery_mv_estimate,
-                 board_state.battery_percent, board_state.charging);
+        (void)box2_board_set_speaker_enabled(false);
     }
-    box2_motion_state_t motion_state = {0};
-    bool motion_ok = board_ok && box2_motion_init(box2_board_i2c_bus()) == ESP_OK;
-    if (motion_ok)
+    if (microphone)
     {
-        motion_ok = box2_motion_read(&motion_state) == ESP_OK;
+        usb_mode_disconnect_serial_phy();
     }
-    ESP_LOGI(TAG, "SC7A20 test: %s", motion_ok ? "PASS" : "FAIL");
-    hardware_test_storage_result_t storage_test = {0};
-    bool storage_ok = hardware_test_storage(&storage_test) == ESP_OK;
-    ESP_LOGI(TAG, "TF/MicroSD test: %s", storage_ok ? "PASS" : "FAIL");
-    bool audio_ok = board_ok && box2_audio_init(box2_board_i2c_bus()) == ESP_OK;
-    ESP_LOGI(TAG, "ES8389/I2S test: %s", audio_ok ? "PASS" : "FAIL");
-    if (audio_ok)
+    const bool lcd_ok = box2_lcd_init() == ESP_OK;
+    // LCD initialization leaves the backlight off. Light it after a valid
+    // first frame rather than exposing panel RAM during codec/USB startup.
+    bool screen_lit = false;
+    esp_err_t audio_error = ESP_ERR_INVALID_STATE;
+    esp_err_t usb_error = ESP_ERR_INVALID_STATE;
+    int gain_db = 30;
+    if (microphone && board_ok)
     {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_audio_play_tone(523, 180));
-        vTaskDelay(pdMS_TO_TICKS(80));
-        ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_audio_play_tone(784, 220));
+        audio_error = box2_audio_init_with_sample_rate(box2_board_i2c_bus(), 48000);
+        if (audio_error == ESP_OK)
+        {
+            audio_error = box2_audio_set_input_gain((float)gain_db);
+        }
+        usb_error = audio_error == ESP_OK ? usb_microphone_start() : audio_error;
     }
-    bool wifi_ok = wifi_test_init() == ESP_OK && wifi_test_scan() == ESP_OK;
-    ESP_LOGI(TAG, "Wi-Fi radio test: %s", wifi_ok ? "PASS" : "FAIL");
-    bool previous_q = board_state.q_pressed;
+    else if (!microphone)
+    {
+        usb_error = usb_mode_start_serial_commands();
+        ESP_LOGI(TAG, "Serial mode ready. Hold Q to switch, hold M to power off.");
+    }
+
+    box2_board_state_t board = {0};
+    device_controls_t controls;
+    bool controls_ready = false;
+    button_filter_t left = {0};
+    button_filter_t right = {0};
     bool previous_left = false;
-    bool previous_middle = false;
     bool previous_right = false;
-    TickType_t last_screen = 0;
-    TickType_t last_battery = 0;
-    TickType_t last_motion = 0;
-    TickType_t last_log = 0;
-    int mic_peak = 0;
-    ESP_LOGI(TAG, "Interactive mode (left to right): Q(BACK)=660Hz, L(LEFT)=440Hz, "
-                  "M=880Hz, R(RIGHT)=1040Hz");
+    bool local_muted = false;
+    bool battery_valid = false;
+    bool power_pending = false;
+    bool power_releasing = false;
+    bool standby = false;
+    uint32_t power_released_at = 0;
+    esp_err_t action_error = initial_error;
+    uint32_t last_battery = now_ms() - 5000;
+    uint32_t last_screen = now_ms() - 200;
+    uint32_t last_capture = now_ms();
+    uint32_t previous_bytes = 0;
+    bool capture_seen = false;
+    int level_percent = 0;
+
     while (true)
     {
-        TickType_t now = xTaskGetTickCount();
-        bool sample_battery = (now - last_battery) >= pdMS_TO_TICKS(5000);
-        if (board_ok && box2_board_read_state(&board_state, sample_battery) == ESP_OK &&
-            sample_battery)
+        uint32_t now = now_ms();
+        const bool sample_battery = !standby && !power_pending &&
+                                    (uint32_t)(now - last_battery) >= 5000;
+        // Key polling remains active after power-off only if external power
+        // keeps the MCU/expander alive. Never toggle CHG_CTRL to sample then.
+        const bool inputs_ok = board_ok &&
+                               box2_board_read_state(&board, sample_battery) == ESP_OK;
+        now = now_ms();
+        if (inputs_ok)
         {
-            last_battery = now;
-        }
-        if (motion_ok && (now - last_motion) >= pdMS_TO_TICKS(100))
-        {
-            if (box2_motion_read(&motion_state) != ESP_OK)
+            if (sample_battery)
             {
-                motion_state.detected = false;
+                last_battery = now;
+                battery_valid = true;
             }
-            last_motion = now;
-        }
-        if (audio_ok)
-        {
-            int new_peak = 0;
-            if (hardware_test_audio_read_peak(&new_peak) == ESP_OK)
+            uint32_t events = DEVICE_CONTROL_NONE;
+            if (!controls_ready)
             {
-                mic_peak = new_peak;
+                device_controls_init(&controls, board.middle_pressed, board.q_pressed, now);
+                controls_ready = true;
+            }
+            else
+            {
+                events = device_controls_update(&controls, board.middle_pressed,
+                                                board.q_pressed, now);
+            }
+
+            if (standby)
+            {
+                if (events & DEVICE_CONTROL_M_SHORT_RELEASE)
+                {
+                    // M is now released, so boot cannot consume this press as
+                    // mute/shutdown. Restart reinitializes the saved USB mode.
+                    if (box2_board_power_on() == ESP_OK)
+                    {
+                        esp_restart();
+                    }
+                }
+            }
+            else
+            {
+                if (events & DEVICE_CONTROL_M_LONG_PRESS)
+                {
+                    power_pending = true;
+                    power_releasing = false;
+                    action_error = ESP_OK;
+                    usb_mode_set_commands_enabled(false);
+                }
+                if (power_pending)
+                {
+                    // M also drives the hardware power-on path. Release it
+                    // before clearing SYS_POW, or it can keep power asserted.
+                    if (board.middle_pressed || controls.middle.pressed)
+                    {
+                        power_releasing = false;
+                    }
+                    else
+                    {
+                        if (!power_releasing)
+                        {
+                            power_releasing = true;
+                            power_released_at = now;
+                        }
+                        if ((uint32_t)(now - power_released_at) >= 100)
+                        {
+                            enter_power_off(microphone, lcd_ok);
+                            standby = true;
+                        }
+                    }
+                }
+                else
+                {
+                    if (events & DEVICE_CONTROL_Q_LONG_PRESS)
+                    {
+                        action_error = ESP_OK;
+                    }
+                    if (events & DEVICE_CONTROL_Q_LONG_RELEASED)
+                    {
+                        const usb_mode_t target = microphone ? USB_MODE_SERIAL : USB_MODE_MICROPHONE;
+                        action_error = usb_mode_switch(target);
+                        if (action_error != ESP_OK)
+                        {
+                            ESP_LOGE(TAG, "USB mode unchanged: %s", esp_err_to_name(action_error));
+                        }
+                    }
+                    if (microphone && (events & DEVICE_CONTROL_M_SHORT_RELEASE))
+                    {
+                        local_muted = !local_muted;
+                        usb_microphone_set_muted(local_muted);
+                    }
+                    const bool l = filtered_button(&left, board.left_pressed, now);
+                    const bool r = filtered_button(&right, board.right_pressed, now);
+                    int requested_gain = gain_db;
+                    if (microphone && l && !previous_left && requested_gain >= 3)
+                    {
+                        requested_gain -= 3;
+                    }
+                    if (microphone && r && !previous_right && requested_gain <= 39)
+                    {
+                        requested_gain += 3;
+                    }
+                    if (requested_gain != gain_db && audio_error == ESP_OK)
+                    {
+                        const esp_err_t gain_error = box2_audio_set_input_gain((float)requested_gain);
+                        if (gain_error == ESP_OK)
+                        {
+                            gain_db = requested_gain;
+                        }
+                        else
+                        {
+                            action_error = gain_error;
+                        }
+                    }
+                    previous_left = l;
+                    previous_right = r;
+                }
             }
         }
-        else
+
+        if (!standby && lcd_ok && (uint32_t)(now - last_screen) >= 200)
         {
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-        if (board_state.q_pressed && !previous_q && audio_ok)
-        {
-            ESP_LOGI(TAG, "BACK(Q) key: speaker 660 Hz");
-            ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_audio_play_tone(660, 180));
-        }
-        if (board_state.left_pressed && !previous_left && audio_ok)
-        {
-            ESP_LOGI(TAG, "LEFT(L) key: speaker 440 Hz");
-            ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_audio_play_tone(440, 180));
-        }
-        if (board_state.middle_pressed && !previous_middle && audio_ok)
-        {
-            ESP_LOGI(TAG, "MIDDLE(M) key: speaker 880 Hz");
-            ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_audio_play_tone(880, 180));
-        }
-        if (board_state.right_pressed && !previous_right && audio_ok)
-        {
-            ESP_LOGI(TAG, "RIGHT(R) key: speaker 1040 Hz");
-            ESP_ERROR_CHECK_WITHOUT_ABORT(hardware_test_audio_play_tone(1040, 180));
-        }
-        previous_q = board_state.q_pressed;
-        previous_left = board_state.left_pressed;
-        previous_middle = board_state.middle_pressed;
-        previous_right = board_state.right_pressed;
-        if ((now - last_screen) >= pdMS_TO_TICKS(400))
-        {
-            update_screen(lcd_ok, audio_ok, board_ok, flash_mb, psram_mb,
-                          &board_state, &motion_state, &storage_test, mic_peak);
+            usb_microphone_stats_t stats = {0};
+            if (microphone)
+            {
+                usb_microphone_get_stats(&stats);
+                if (stats.bytes_sent != previous_bytes)
+                {
+                    last_capture = now;
+                    capture_seen = true;
+                }
+                previous_bytes = stats.bytes_sent;
+            }
+            const bool connected = microphone ? usb_error == ESP_OK && tud_mounted()
+                                              : usb_serial_jtag_is_connected();
+            const bool recording = microphone && connected && capture_seen &&
+                                   (uint32_t)(now - last_capture) < 500;
+            const bool muted = microphone && usb_microphone_is_muted();
+            const int target_level = recording && !muted ? stats.peak * 100 / 32768 : 0;
+            level_percent = target_level >= level_percent ? target_level :
+                            (3 * level_percent + target_level) / 4;
+            if (!recording || muted)
+            {
+                level_percent = 0;
+            }
+            device_screen_state_t screen = {
+                .mode = microphone ? DEVICE_SCREEN_MODE_MICROPHONE : DEVICE_SCREEN_MODE_SERIAL,
+                .usb_connected = connected,
+                .recording = recording,
+                .audio_ready = audio_error == ESP_OK,
+                .muted = muted,
+                .charging = board.charging,
+                .battery_percent = battery_valid ? board.battery_percent : -1,
+                .gain_db = gain_db,
+                .level_percent = level_percent,
+                .action = action_error == ESP_OK && board_ok && usb_error == ESP_OK
+                              ? DEVICE_SCREEN_ACTION_NONE : DEVICE_SCREEN_ACTION_ERROR,
+            };
+            if (controls_ready)
+            {
+                if (power_pending || device_controls_hold_percent(&controls.middle, now) > 0)
+                {
+                    screen.action = DEVICE_SCREEN_ACTION_POWER_OFF;
+                    screen.action_progress_percent = power_pending ? 100 :
+                        device_controls_hold_percent(&controls.middle, now);
+                }
+                else if (controls.q_pending || device_controls_hold_percent(&controls.q, now) > 0)
+                {
+                    screen.action = DEVICE_SCREEN_ACTION_SWITCH_MODE;
+                    screen.action_progress_percent = controls.q_pending ? 100 :
+                        device_controls_hold_percent(&controls.q, now);
+                }
+            }
+            if (device_screen_show(&screen) == ESP_OK && !screen_lit)
+            {
+                (void)box2_lcd_set_backlight(85);
+                screen_lit = true;
+            }
             last_screen = now;
         }
-        if ((now - last_log) >= pdMS_TO_TICKS(2000))
+        vTaskDelay(pdMS_TO_TICKS(standby ? 40 : 20));
+    }
+}
+
+void app_main(void)
+{
+    // M momentarily powers the board during a battery boot. Latch SYS_POW
+    // before NVS work or the 200 ms USB detach so a short press can start it.
+    // Restore the retained PHY first, before the board driver emits any logs.
+    usb_mode_restore_serial_phy();
+    (void)box2_board_init();
+    const esp_err_t mode_error = usb_mode_init();
+    if (mode_error != ESP_OK)
+    {
+        ESP_LOGE(TAG, "NVS mode unavailable; using serial: %s", esp_err_to_name(mode_error));
+    }
+    bool microphone = usb_mode_current() == USB_MODE_MICROPHONE;
+    if (microphone)
+    {
+        const esp_reset_reason_t reason = esp_reset_reason();
+        if (reason == ESP_RST_PANIC || reason == ESP_RST_INT_WDT ||
+            reason == ESP_RST_TASK_WDT || reason == ESP_RST_WDT)
         {
-            last_log = now;
-            ESP_LOGI(TAG, "mic=%5d keys=Q%d L%d M%d R%d raw=%d%d%d%d battery=%d%% "
-                          "xio=0x%04X acc=%+d,%+d,%+dmg orient=%s sd=%s rw=%s",
-                     mic_peak, board_state.q_pressed, board_state.left_pressed,
-                     board_state.middle_pressed, board_state.right_pressed,
-                     board_state.q_level, board_state.left_level,
-                     board_state.middle_level, board_state.right_level,
-                     board_state.battery_percent, board_state.xio, motion_state.x_mg,
-                     motion_state.y_mg, motion_state.z_mg,
-                     motion_state.orientation ? motion_state.orientation : "NONE",
-                     storage_test.storage.mounted ? "MOUNTED" : "NO_CARD",
-                     storage_test.read_write_ok ? "PASS" : "FAIL");
+            ESP_LOGW(TAG, "Microphone crashed; restoring serial mode");
+            (void)usb_mode_switch(USB_MODE_SERIAL);
+            // If saving failed, still provide serial recovery for this boot.
+            microphone = false;
         }
     }
+    run_device(microphone, mode_error);
 }

@@ -213,7 +213,8 @@ esp_err_t box2_lcd_init(void)
                         "disable LCD mirror");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_panel, true), TAG,
                         "turn display on");
-    return box2_lcd_set_backlight(100);
+    // The application draws its first frame before enabling the backlight.
+    return box2_lcd_set_backlight(0);
 }
 
 esp_err_t box2_lcd_set_backlight(uint8_t percent)
