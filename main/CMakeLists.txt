@@ -1,19 +1,25 @@
 idf_component_register(
     SRCS
         "main.c"
-        "device_screen.c"
         "device_controls.c"
+        "device_screen.c"
+        "device_tone.c"
+        "mic_stream.c"
+        "usb_hid.c"
         "usb_mode.c"
         "usb_microphone.c"
+        "voice_wake.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         driver
         nvs_flash
         esp_timer
+        esp_ringbuf
         esp_driver_usb_serial_jtag
         esp_hal_usb
         usb_device_uac
         espressif__tinyusb
+        espressif__esp-sr
 )
 
 # usb_device_uac 1.3.1 allocates feature-control state for speaker channels,
@@ -39,3 +45,9 @@ foreach(source_property SOURCES INTERFACE_SOURCES)
 endforeach()
 # Keep callbacks in the same archive as their TinyUSB consumers.
 target_sources(${tinyusb_library} PRIVATE "${CMAKE_CURRENT_LIST_DIR}/usb_descriptors.c")
+
+# The composite device adds a boot keyboard next to the UAC microphone.
+# usb_device_uac supplies tusb_config.h, which does not enable HID, so set the
+# class switch here. PUBLIC keeps usbd.c, hid_device.c and main/*.c consistent;
+# a mismatch would compile the descriptor without the driver behind it.
+target_compile_definitions(${tinyusb_library} PUBLIC CFG_TUD_HID=1)

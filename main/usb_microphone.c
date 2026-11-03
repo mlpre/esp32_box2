@@ -8,6 +8,7 @@
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "mic_stream.h"
 #include "sdkconfig.h"
 #include "tusb.h"
 #include "usb_device_uac.h"
@@ -18,8 +19,9 @@ enum
     MIC_SAMPLE_RATE = 48000,
     MIC_FRAME_SAMPLES = MIC_SAMPLE_RATE / 1000 * CONFIG_UAC_MIC_INTERVAL_MS,
     MIC_FRAME_BYTES = MIC_FRAME_SAMPLES * sizeof(int16_t),
-    DC_FIXED_SCALE = 256,
-    DC_FILTER_DIVISOR = 1024,
+    // Long enough to ride out a scheduling hiccup, short enough that the
+    // host never gets stale audio after the mute gate opens.
+    MIC_READ_TIMEOUT_MS = 10,
 };
 
 _Static_assert(CONFIG_UAC_SAMPLE_RATE == MIC_SAMPLE_RATE, "USB and codec rates must be 48 kHz");
@@ -38,10 +40,9 @@ static bool s_powering_off;
 static bool s_initialization_attempted;
 static esp_err_t s_start_result = ESP_ERR_INVALID_STATE;
 
-// Only the UAC microphone task accesses the capture/filter state.
+// Only the UAC microphone task accesses this staging buffer. DC removal and
+// peak tracking live in mic_stream, which owns the I2S reader.
 static int16_t s_samples[MIC_FRAME_SAMPLES];
-static int32_t s_dc_q8;
-static bool s_dc_initialized;
 
 static void microphone_mute_cb(uint32_t muted, void *cb_ctx)
 {
@@ -64,24 +65,6 @@ static void microphone_shutdown_handler(void)
     // Do not deinitialize TinyUSB here: the component's tud_task remains
     // alive until reboot and may still be waiting on its event queue.
     usb_mode_restore_serial_phy();
-}
-
-static int16_t remove_dc(int16_t sample)
-{
-    const int32_t scaled_sample = (int32_t)sample * DC_FIXED_SCALE;
-    // A continuous first-order DC estimate, about 7.5 Hz at 48 kHz.
-    // Keep the estimate across blocks to avoid block-boundary discontinuities.
-    s_dc_q8 += (scaled_sample - s_dc_q8) / DC_FILTER_DIVISOR;
-    int32_t centered = (scaled_sample - s_dc_q8) / DC_FIXED_SCALE;
-    if (centered > INT16_MAX)
-    {
-        centered = INT16_MAX;
-    }
-    else if (centered < INT16_MIN)
-    {
-        centered = INT16_MIN;
-    }
-    return (int16_t)centered;
 }
 
 static esp_err_t microphone_input_cb(uint8_t *buf, size_t len, size_t *bytes_read,
@@ -111,58 +94,45 @@ static esp_err_t microphone_input_cb(uint8_t *buf, size_t len, size_t *bytes_rea
         return ESP_OK;
     }
 
-    // The component calls this from its microphone task, not the USB ISR.
-    // Its task already schedules capture at 10 ms intervals. The I2S read
-    // blocks for samples; adding a delay here would disrupt that schedule.
+    portENTER_CRITICAL(&s_state_lock);
+    const bool muted = s_local_muted || s_host_muted;
+    portEXIT_CRITICAL(&s_state_lock);
+
+    // The component calls this from its microphone task, not the USB ISR, once
+    // every 10 ms. Capture itself now runs continuously in mic_stream; this
+    // callback only drains the ring at the host's cadence.
     memset(s_samples, 0, sizeof(s_samples));
-    const esp_err_t read_result = box2_audio_read(s_samples, MIC_FRAME_SAMPLES);
-    int peak = 0;
-    if (read_result == ESP_OK)
+    if (muted)
     {
-        if (!s_dc_initialized)
-        {
-            int32_t sum = 0;
-            for (size_t i = 0; i < MIC_FRAME_SAMPLES; ++i)
-            {
-                sum += s_samples[i];
-            }
-            s_dc_q8 = (sum / MIC_FRAME_SAMPLES) * DC_FIXED_SCALE;
-            s_dc_initialized = true;
-        }
+        // While the gate is closed, drop what queued up. Otherwise opening the
+        // gate would hand the host up to 100 ms of room audio recorded before
+        // the user asked to talk.
+        mic_stream_discard();
+        memset(buf, 0, len);
+    }
+    else if (mic_stream_read_pcm(s_samples, MIC_FRAME_SAMPLES, MIC_READ_TIMEOUT_MS) ==
+             MIC_FRAME_SAMPLES)
+    {
         for (size_t i = 0; i < MIC_FRAME_SAMPLES; ++i)
         {
-            const int16_t sample = remove_dc(s_samples[i]);
-            const int magnitude = sample < 0 ? -(int)sample : (int)sample;
-            if (magnitude > peak)
-            {
-                peak = magnitude;
-            }
             // Explicit USB little-endian encoding avoids buffer alignment
             // assumptions and preserves exactly one 16-bit sample per frame.
-            const uint16_t encoded = (uint16_t)sample;
+            const uint16_t encoded = (uint16_t)s_samples[i];
             buf[2 * i] = (uint8_t)encoded;
             buf[2 * i + 1] = (uint8_t)(encoded >> 8);
         }
     }
     else
     {
-        // Drop the entire failed read, including any partial data. Return
-        // silence successfully so UAC keeps its normal scheduling cadence.
+        // Short read: return silence so UAC keeps its normal scheduling cadence.
         memset(buf, 0, len);
-        s_dc_initialized = false;
     }
 
     portENTER_CRITICAL(&s_state_lock);
-    const bool muted = s_local_muted || s_host_muted;
-    s_stats.read_errors += read_result != ESP_OK;
+    s_stats.read_errors = mic_stream_read_errors();
     s_stats.bytes_sent += (uint32_t)len;
-    s_stats.peak = peak;
+    s_stats.peak = mic_stream_peak();
     portEXIT_CRITICAL(&s_state_lock);
-    if (muted)
-    {
-        // Capture and DC tracking continue while muted; no stale PCM is kept.
-        memset(buf, 0, len);
-    }
     *bytes_read = len;
     return ESP_OK;
 }

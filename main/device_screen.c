@@ -373,18 +373,13 @@ static void microphone_page(const device_screen_state_t *state)
     const uint16_t foreground = rgb565(238, 244, 250);
     const uint16_t subtle = rgb565(147, 167, 182);
     uint16_t accent = rgb565(47, 222, 178);
-    const char *status = state->recording ? "正在录音" : "准备就绪";
-    const char *caption = state->recording ? "电脑正在使用麦克风" : "打开电脑录音应用";
-    const char *badge = state->recording ? "LIVE" : "READY";
+    const char *status = state->listening ? "正在录音" : "准备就绪";
+    const char *caption = state->listening ? "按M可关闭录音" : "按M可开启录音";
+    const char *badge = state->listening ? "LIVE" : "READY";
     if (!state->usb_connected)
     {
         status = "等待连接"; caption = "连接电脑即可使用"; badge = "WAIT";
         accent = rgb565(147, 167, 182);
-    }
-    else if (state->muted)
-    {
-        status = "已静音"; caption = "麦克风输出已静音"; badge = "MUTE";
-        accent = rgb565(255, 197, 105);
     }
     if (!state->audio_ready)
     {
@@ -394,11 +389,11 @@ static void microphone_page(const device_screen_state_t *state)
     round_rect(12, 46, 216, 100, 12, card);
     text(26, 58, "USB 麦克风", 14, 1, subtle);
     chip(171, 58, badge, accent, rgb565(31, 47, 57));
-    microphone_icon(30, 87, accent, state->muted);
+    microphone_icon(30, 87, accent, false);
     centered(63, 87, 150, status, 14, 2, foreground);
     centered(20, 126, 200, caption, 12, 1, subtle);
 
-    const int level = state->recording && state->usb_connected && state->audio_ready
+    const int level = state->listening && state->usb_connected && state->audio_ready
                           ? clamp(state->level_percent, 0, 100) : 0;
     round_rect(12, 156, 216, 58, 12, card);
     text(24, 166, "输入电平", 14, 1, subtle);
@@ -412,7 +407,6 @@ static void microphone_page(const device_screen_state_t *state)
         if (i < lit_segments)
         {
             color = i >= 29 ? rgb565(245, 112, 115) : i >= 25 ? rgb565(255, 197, 105) : rgb565(47, 222, 178);
-            if (state->muted) color = rgb565(111, 132, 146);
         }
         round_rect(24 + i * 6, 192, 4, 11, 1, color);
     }
@@ -482,7 +476,7 @@ static void footer(const device_screen_state_t *state)
         text(16, 302, "L/R", 12, 1, rgb565(220, 234, 244));
         text(42, 302, "调节增益", 12, 1, subtle);
         keycap(140, 301, "M");
-        text(160, 302, "短按静音", 12, 1, subtle);
+        text(160, 302, "短按录音", 12, 1, subtle);
     }
 }
 

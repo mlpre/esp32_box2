@@ -183,18 +183,31 @@ esp_err_t box2_audio_init_with_sample_rate(i2c_master_bus_handle_t i2c_bus,
                       fail, TAG, "keep output codec active");
     ESP_GOTO_ON_ERROR(esp_codec_set_disable_when_closed(s_input_dev, false),
                       fail, TAG, "keep input codec active");
-    esp_codec_dev_sample_info_t sample_info = {
+    esp_codec_dev_sample_info_t input_info = {
         .bits_per_sample = 16,
         .channel = 1,
         // esp_codec_dev 1.6.2 maps mono to ch0 / I2S LEFT: ES8389 ADCL.
-        // The right slot is the DAC reference when no_dac_ref is false.
         .channel_mask = ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0),
         .sample_rate = sample_rate,
         .mclk_multiple = 0,
     };
-    ESP_GOTO_ON_ERROR(open_device_checked(s_output_dev, ESP_CODEC_DEV_TYPE_OUT, &sample_info),
+    /*
+     * The speaker has to be driven as stereo. With no_dac_ref = false the
+     * ES8389 derives its DAC reference from the second slot; a mono-left TX
+     * stream leaves that slot at zero, which shifts the differential output to
+     * one rail. The amplifier then turns that DC step into a loud thump every
+     * time SPK_EN toggles. Both slots get the same signal below.
+     */
+    esp_codec_dev_sample_info_t output_info = {
+        .bits_per_sample = 16,
+        .channel = 2,
+        .channel_mask = 0, // Let the codec layer enable both slots.
+        .sample_rate = sample_rate,
+        .mclk_multiple = 0,
+    };
+    ESP_GOTO_ON_ERROR(open_device_checked(s_output_dev, ESP_CODEC_DEV_TYPE_OUT, &output_info),
                       fail, TAG, "open speaker and configure I2S TX");
-    ESP_GOTO_ON_ERROR(open_device_checked(s_input_dev, ESP_CODEC_DEV_TYPE_IN, &sample_info),
+    ESP_GOTO_ON_ERROR(open_device_checked(s_input_dev, ESP_CODEC_DEV_TYPE_IN, &input_info),
                       fail, TAG, "open microphone and configure I2S RX");
     ESP_GOTO_ON_ERROR(esp_codec_dev_set_out_vol(s_output_dev, 0), fail, TAG, "silence speaker");
     ESP_GOTO_ON_ERROR(esp_codec_dev_set_in_gain(s_input_dev, 40.0f), fail, TAG, "set mic gain");
@@ -222,14 +235,15 @@ esp_err_t box2_audio_set_input_gain(float gain_db)
     return esp_codec_dev_set_in_gain(s_input_dev, gain_db);
 }
 
-esp_err_t box2_audio_write(const int16_t *samples, size_t sample_count)
+esp_err_t box2_audio_write(const int16_t *stereo_frames, size_t frame_count)
 {
-    if (!s_output_dev || !samples || sample_count == 0)
+    if (!s_output_dev || !stereo_frames || frame_count == 0)
     {
         return ESP_ERR_INVALID_ARG;
     }
-    return esp_codec_dev_write(s_output_dev, (void *)samples,
-                               sample_count * sizeof(*samples));
+    // The TX slot is stereo, so every frame is left + right interleaved.
+    return esp_codec_dev_write(s_output_dev, (void *)stereo_frames,
+                               frame_count * 2 * sizeof(*stereo_frames));
 }
 
 esp_err_t box2_audio_read(int16_t *samples, size_t sample_count)

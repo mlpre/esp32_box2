@@ -1,18 +1,23 @@
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 #include "box2.h"
 #include "device_controls.h"
 #include "device_screen.h"
+#include "device_tone.h"
 #include "driver/usb_serial_jtag.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "mic_stream.h"
 #include "tusb.h"
+#include "usb_hid.h"
 #include "usb_microphone.h"
 #include "usb_mode.h"
+#include "voice_wake.h"
 
 static const char *TAG = "box2";
 
@@ -49,9 +54,49 @@ static int discard_usb_log(const char *format, va_list arguments)
     return 0;
 }
 
+/*
+ * One code path for both triggers. The button and the wake word must produce
+ * byte-identical behaviour, otherwise "it works when I press it" stops being
+ * evidence that anything else works.
+ */
+static void dictation_begin(void)
+{
+    voice_wake_set_listening(true);
+    // The speaker sits next to the microphone, so ignore the detector while
+    // the cue plays and the wake word tail drains out of the ring.
+    voice_wake_blank(700);
+    // Tell the host first. The old order played the cue before pressing the
+    // key, which put the cue length between the button and the app opening its
+    // stream; this way the app is already listening while the cue sounds.
+    if (usb_hid_start() != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Push-to-talk key was not sent");
+    }
+    // Still muted, so the cue cannot land in the transcript. The cue doubles as
+    // the "speak now" signal, and the microphone goes live as it ends.
+    device_tone_start();
+    usb_microphone_set_muted(false);
+}
+
+static void dictation_end(void)
+{
+    usb_microphone_set_muted(true);
+    // Stop the host before the cue: the app closes its stream immediately, and
+    // the cue then plays into something nobody is recording.
+    (void)usb_hid_stop();
+    voice_wake_set_listening(false);
+    voice_wake_blank(700);
+    device_tone_stop();
+}
+
 static void enter_power_off(bool microphone, bool lcd_ok)
 {
     usb_mode_set_commands_enabled(false);
+    // A held keyboard report would survive the detach and stay stuck on the
+    // host, so release it while the device is still enumerated. This must not
+    // tap: powering off should never type into whatever window has focus.
+    (void)usb_hid_release();
+    usb_microphone_set_muted(true);
     if (lcd_ok)
     {
         (void)device_screen_show_power_off();
@@ -106,6 +151,23 @@ static void run_device(bool microphone, esp_err_t initial_error)
         {
             audio_error = box2_audio_set_input_gain((float)gain_db);
         }
+        if (audio_error == ESP_OK)
+        {
+            // Capture has to run before the USB device does: the wake word only
+            // works because the microphone is listening when no host stream is
+            // open.
+            audio_error = mic_stream_start();
+        }
+        if (audio_error == ESP_OK)
+        {
+            const esp_err_t wake_error = voice_wake_start();
+            if (wake_error != ESP_OK)
+            {
+                // The button path is independent. A missing model must cost
+                // the wake word, not the microphone.
+                ESP_LOGW(TAG, "Wake word unavailable: %s", esp_err_to_name(wake_error));
+            }
+        }
         usb_error = audio_error == ESP_OK ? usb_microphone_start() : audio_error;
     }
     else if (!microphone)
@@ -121,7 +183,11 @@ static void run_device(bool microphone, esp_err_t initial_error)
     button_filter_t right = {0};
     bool previous_left = false;
     bool previous_right = false;
-    bool local_muted = false;
+    // Push-to-talk replaces the old free-running capture: the microphone only
+    // carries signal while the user is actually dictating, so a host stream left
+    // open by an application cannot pick up room audio. Idle means muted.
+    bool listening = false;
+    usb_microphone_set_muted(true);
     bool battery_valid = false;
     bool power_pending = false;
     bool power_releasing = false;
@@ -130,6 +196,13 @@ static void run_device(bool microphone, esp_err_t initial_error)
     esp_err_t action_error = initial_error;
     uint32_t last_battery = now_ms() - 5000;
     uint32_t last_screen = now_ms() - 200;
+    // The frame only changes on a state transition or a new level sample.
+    // Redrawing an identical frame costs a full 153 KB PSRAM-to-panel transfer
+    // five times a second for nothing, and that bandwidth is shared with the
+    // audio and wake engines.
+    device_screen_state_t last_screen_state;
+    memset(&last_screen_state, 0, sizeof(last_screen_state));
+    bool screen_drawn = false;
     uint32_t last_capture = now_ms();
     uint32_t previous_bytes = 0;
     bool capture_seen = false;
@@ -180,10 +253,16 @@ static void run_device(bool microphone, esp_err_t initial_error)
             {
                 if (events & DEVICE_CONTROL_M_LONG_PRESS)
                 {
-                    power_pending = true;
-                    power_releasing = false;
-                    action_error = ESP_OK;
-                    usb_mode_set_commands_enabled(false);
+                    // Holding M is a natural thing to do mid-sentence, so while
+                    // dictating the long press means "still talking", not "power
+                    // off". Stop listening first, then hold again to shut down.
+                    if (!listening)
+                    {
+                        power_pending = true;
+                        power_releasing = false;
+                        action_error = ESP_OK;
+                        usb_mode_set_commands_enabled(false);
+                    }
                 }
                 if (power_pending)
                 {
@@ -215,6 +294,10 @@ static void run_device(bool microphone, esp_err_t initial_error)
                     }
                     if (events & DEVICE_CONTROL_Q_LONG_RELEASED)
                     {
+                        // Release any held push-to-talk key before the USB device
+                        // disappears, or the host keeps the key asserted.
+                        usb_microphone_set_muted(true);
+                        (void)usb_hid_release();
                         const usb_mode_t target = microphone ? USB_MODE_SERIAL : USB_MODE_MICROPHONE;
                         action_error = usb_mode_switch(target);
                         if (action_error != ESP_OK)
@@ -224,8 +307,15 @@ static void run_device(bool microphone, esp_err_t initial_error)
                     }
                     if (microphone && (events & DEVICE_CONTROL_M_SHORT_RELEASE))
                     {
-                        local_muted = !local_muted;
-                        usb_microphone_set_muted(local_muted);
+                        listening = !listening;
+                        if (listening)
+                        {
+                            dictation_begin();
+                        }
+                        else
+                        {
+                            dictation_end();
+                        }
                     }
                     const bool l = filtered_button(&left, board.left_pressed, now);
                     const bool r = filtered_button(&right, board.right_pressed, now);
@@ -256,6 +346,23 @@ static void run_device(bool microphone, esp_err_t initial_error)
             }
         }
 
+        // Wake word and end-of-speech are polled outside the key path: the
+        // detector result must not be lost because a board read failed.
+        if (microphone && !standby && audio_error == ESP_OK && voice_wake_available())
+        {
+            const uint32_t voice = voice_wake_take_events();
+            if ((voice & VOICE_WAKE_START) && !listening && !power_pending)
+            {
+                listening = true;
+                dictation_begin();
+            }
+            else if ((voice & VOICE_WAKE_STOP) && listening)
+            {
+                listening = false;
+                dictation_end();
+            }
+        }
+
         if (!standby && lcd_ok && (uint32_t)(now - last_screen) >= 200)
         {
             usb_microphone_stats_t stats = {0};
@@ -273,11 +380,10 @@ static void run_device(bool microphone, esp_err_t initial_error)
                                               : usb_serial_jtag_is_connected();
             const bool recording = microphone && connected && capture_seen &&
                                    (uint32_t)(now - last_capture) < 500;
-            const bool muted = microphone && usb_microphone_is_muted();
-            const int target_level = recording && !muted ? stats.peak * 100 / 32768 : 0;
+            const int target_level = recording && listening ? stats.peak * 100 / 32768 : 0;
             level_percent = target_level >= level_percent ? target_level :
                             (3 * level_percent + target_level) / 4;
-            if (!recording || muted)
+            if (!recording || !listening)
             {
                 level_percent = 0;
             }
@@ -286,7 +392,7 @@ static void run_device(bool microphone, esp_err_t initial_error)
                 .usb_connected = connected,
                 .recording = recording,
                 .audio_ready = audio_error == ESP_OK,
-                .muted = muted,
+                .listening = listening,
                 .charging = board.charging,
                 .battery_percent = battery_valid ? board.battery_percent : -1,
                 .gain_db = gain_db,
@@ -296,7 +402,8 @@ static void run_device(bool microphone, esp_err_t initial_error)
             };
             if (controls_ready)
             {
-                if (power_pending || device_controls_hold_percent(&controls.middle, now) > 0)
+                if (!listening &&
+                    (power_pending || device_controls_hold_percent(&controls.middle, now) > 0))
                 {
                     screen.action = DEVICE_SCREEN_ACTION_POWER_OFF;
                     screen.action_progress_percent = power_pending ? 100 :
@@ -309,10 +416,17 @@ static void run_device(bool microphone, esp_err_t initial_error)
                         device_controls_hold_percent(&controls.q, now);
                 }
             }
-            if (device_screen_show(&screen) == ESP_OK && !screen_lit)
+            const bool changed =
+                !screen_drawn || memcmp(&screen, &last_screen_state, sizeof(screen)) != 0;
+            if (changed && device_screen_show(&screen) == ESP_OK)
             {
-                (void)box2_lcd_set_backlight(85);
-                screen_lit = true;
+                last_screen_state = screen;
+                screen_drawn = true;
+                if (!screen_lit)
+                {
+                    (void)box2_lcd_set_backlight(85);
+                    screen_lit = true;
+                }
             }
             last_screen = now;
         }
@@ -331,6 +445,11 @@ void app_main(void)
     if (mode_error != ESP_OK)
     {
         ESP_LOGE(TAG, "NVS mode unavailable; using serial: %s", esp_err_to_name(mode_error));
+    }
+    const esp_err_t hid_error = usb_hid_init();
+    if (hid_error != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Push-to-talk key unavailable: %s", esp_err_to_name(hid_error));
     }
     bool microphone = usb_mode_current() == USB_MODE_MICROPHONE;
     if (microphone)

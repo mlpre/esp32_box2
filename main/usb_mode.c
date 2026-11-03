@@ -8,6 +8,7 @@
 #include <string.h>
 #include <unistd.h>
 #include "driver/usb_serial_jtag_vfs.h"
+#include "device_tone.h"
 #include "esp_private/periph_ctrl.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -15,6 +16,7 @@
 #include "hal/usb_serial_jtag_ll.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "usb_hid.h"
 
 #define USB_MODE_NVS_NAMESPACE "box2_usb"
 #define USB_MODE_NVS_KEY "mode"
@@ -190,11 +192,55 @@ esp_err_t usb_mode_switch(usb_mode_t mode)
 static void print_help(void)
 {
     printf("\nBOX2 USB mode commands:\n"
-           "  usb mic     - save microphone mode and restart\n"
-           "  usb serial  - save serial mode and restart\n"
-           "  usb status  - show current mode\n"
-           "  help        - show this help\n"
-           "Hold Q for 2 seconds to switch USB mode.\n");
+           "  usb mic          - save microphone mode and restart\n"
+           "  usb serial       - save serial mode and restart\n"
+           "  usb status       - show current mode\n"
+           "  ptt              - show the push-to-talk key\n"
+           "  ptt win+h        - set the key the device sends to the host\n"
+           "  ptt mode tap     - one press per talk (toggle hotkeys)\n"
+           "  ptt mode hold    - press on start, release on stop\n"
+           "  ptt off          - stop sending any key\n"
+           "  beep             - play the cue (microphone mode only)\n"
+           "  help             - show this help\n"
+           "Hold Q for 2 seconds to switch USB mode.\n"
+           "Keys are stored in NVS and apply to the microphone mode.\n");
+}
+
+static void print_ptt(void)
+{
+    printf("Push-to-talk: key=%s, mode=%s, %s\n", usb_hid_combo_text(),
+           usb_hid_mode_name(), usb_hid_enabled() ? "enabled" : "disabled");
+}
+
+/* `ptt` is the only way to change the hotkey: the microphone personality has no
+ * console of its own, so this command configures the next microphone boot. */
+static void handle_ptt(const char *argument)
+{
+    if (*argument == '\0' || strcmp(argument, "status") == 0)
+    {
+        print_ptt();
+        return;
+    }
+    if (strncmp(argument, "mode ", 5) == 0)
+    {
+        if (usb_hid_set_mode(argument + 5) == ESP_OK)
+        {
+            printf("Push-to-talk mode: %s\n", usb_hid_mode_name());
+        }
+        else
+        {
+            printf("Unknown mode. Use tap or hold.\n");
+        }
+        return;
+    }
+    if (usb_hid_set_combo(argument) == ESP_OK)
+    {
+        printf("Push-to-talk key: %s\n", usb_hid_combo_text());
+    }
+    else
+    {
+        printf("Invalid key. Examples: win+h, ctrl+shift+d, f13, enter, off.\n");
+    }
 }
 
 static void execute_command(char *line)
@@ -229,6 +275,28 @@ static void execute_command(char *line)
     if (!strcmp(line, "help"))
     {
         print_help();
+        return;
+    }
+    if (strncmp(line, "ptt", 3) == 0 && (line[3] == '\0' || line[3] == ' '))
+    {
+        handle_ptt(line[3] == '\0' ? "" : &line[4]);
+        return;
+    }
+    if (!strcmp(line, "beep"))
+    {
+        const esp_err_t err = device_tone_self_test();
+        if (err == ESP_OK)
+        {
+            printf("Cue played.\n");
+        }
+        else if (err == ESP_ERR_INVALID_STATE)
+        {
+            printf("Audio starts only in microphone mode.\n");
+        }
+        else
+        {
+            printf("Cue failed: %s\n", esp_err_to_name(err));
+        }
         return;
     }
     if (!strcmp(line, "usb status"))

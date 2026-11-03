@@ -1,6 +1,7 @@
 #include "box2_lcd.h"
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 #include "box2_config.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
@@ -9,13 +10,31 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 static const char *TAG = "box2_lcd";
 static esp_lcd_panel_handle_t s_panel;
 static esp_lcd_panel_io_handle_t s_panel_io;
 static SemaphoreHandle_t s_transfer_done;
+
+/*
+ * Frames are composed in a PSRAM framebuffer, but the I80 DMA must not read
+ * from it. External memory is shared with the instruction/data cache, so a long
+ * burst competes with every other task touching PSRAM and can come back with
+ * stale or interleaved data. That corruption is invisible while the picture is
+ * static (a stale frame looks identical) and obvious the moment it changes.
+ * Copying through a small internal buffer keeps the DMA on the fast path.
+ */
+enum
+{
+    LCD_STRIP_ROWS = 16,
+    LCD_STRIP_BYTES = BOX2_LCD_WIDTH * LCD_STRIP_ROWS * sizeof(uint16_t),
+};
+
+static uint16_t *s_strip;
 static bool IRAM_ATTR on_color_transfer_done(esp_lcd_panel_io_handle_t panel_io,
                                              esp_lcd_panel_io_event_data_t *edata,
                                              void *user_ctx)
@@ -96,6 +115,14 @@ esp_err_t box2_lcd_init(void)
     ESP_RETURN_ON_FALSE(s_transfer_done, ESP_ERR_NO_MEM, TAG,
                         "create LCD semaphore");
     xSemaphoreGive(s_transfer_done);
+    // 64-byte aligned so every strip satisfies the GDMA alignment check.
+    s_strip = heap_caps_aligned_alloc(64, LCD_STRIP_BYTES,
+                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    if (!s_strip)
+    {
+        // Not fatal: drawing falls back to a single external-memory transfer.
+        ESP_LOGW(TAG, "No internal strip buffer; drawing straight from PSRAM");
+    }
     const esp_lcd_panel_io_i80_config_t io_cfg = {
         .cs_gpio_num = BOX2_LCD_CS,
         .pclk_hz = 20 * 1000 * 1000,
@@ -229,15 +256,9 @@ esp_err_t box2_lcd_set_backlight(uint8_t percent)
     return ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
-esp_err_t box2_lcd_draw_bitmap(int x_start, int y_start, int x_end, int y_end,
-                               const uint16_t *pixels)
+static esp_err_t transfer_region(int x_start, int y_start, int x_end, int y_end,
+                                 const uint16_t *pixels)
 {
-    ESP_RETURN_ON_FALSE(s_panel && pixels, ESP_ERR_INVALID_STATE, TAG,
-                        "LCD is not initialized");
-    ESP_RETURN_ON_FALSE(x_start >= 0 && y_start >= 0 && x_end > x_start &&
-                            y_end > y_start && x_end <= BOX2_LCD_WIDTH &&
-                            y_end <= BOX2_LCD_HEIGHT,
-                        ESP_ERR_INVALID_ARG, TAG, "invalid bitmap bounds");
     ESP_RETURN_ON_FALSE(xSemaphoreTake(s_transfer_done, pdMS_TO_TICKS(1000)) == pdTRUE,
                         ESP_ERR_TIMEOUT, TAG, "wait for LCD bus");
     esp_err_t err = esp_lcd_panel_draw_bitmap(s_panel, x_start, y_start,
@@ -250,6 +271,37 @@ esp_err_t box2_lcd_draw_bitmap(int x_start, int y_start, int x_end, int y_end,
     ESP_RETURN_ON_FALSE(xSemaphoreTake(s_transfer_done, pdMS_TO_TICKS(1000)) == pdTRUE,
                         ESP_ERR_TIMEOUT, TAG, "wait for LCD transfer");
     xSemaphoreGive(s_transfer_done);
+    return ESP_OK;
+}
+
+esp_err_t box2_lcd_draw_bitmap(int x_start, int y_start, int x_end, int y_end,
+                               const uint16_t *pixels)
+{
+    ESP_RETURN_ON_FALSE(s_panel && pixels, ESP_ERR_INVALID_STATE, TAG,
+                        "LCD is not initialized");
+    ESP_RETURN_ON_FALSE(x_start >= 0 && y_start >= 0 && x_end > x_start &&
+                            y_end > y_start && x_end <= BOX2_LCD_WIDTH &&
+                            y_end <= BOX2_LCD_HEIGHT,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid bitmap bounds");
+    const int width = x_end - x_start;
+    // Only full-width regions have a known row stride, and only those are large
+    // enough to be worth splitting.
+    if (!esp_ptr_external_ram(pixels) || !s_strip || width != BOX2_LCD_WIDTH)
+    {
+        return transfer_region(x_start, y_start, x_end, y_end, pixels);
+    }
+
+    const size_t row_bytes = (size_t)width * sizeof(uint16_t);
+    for (int y = y_start; y < y_end; y += LCD_STRIP_ROWS)
+    {
+        const int rows = (y_end - y) < LCD_STRIP_ROWS ? (y_end - y) : LCD_STRIP_ROWS;
+        memcpy(s_strip, pixels + (size_t)y * width, row_bytes * (size_t)rows);
+        const esp_err_t err = transfer_region(x_start, y, x_end, y + rows, s_strip);
+        if (err != ESP_OK)
+        {
+            return err;
+        }
+    }
     return ESP_OK;
 }
 

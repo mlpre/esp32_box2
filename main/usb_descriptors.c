@@ -25,6 +25,7 @@
  */
 
 #include "tusb.h"
+#include "class/hid/hid_device.h"
 #include "uac_descriptors.h"
 
 // usb_device_uac 1.3.1 sizes its feature-control arrays from speaker channels.
@@ -99,17 +100,102 @@ uint8_t const *tud_descriptor_device_cb(void)
 //--------------------------------------------------------------------+
 // Configuration Descriptor
 //--------------------------------------------------------------------+
-#define CONFIG_TOTAL_LEN        (TUD_CONFIG_DESC_LEN + CFG_TUD_AUDIO * TUD_AUDIO_DEVICE_DESC_LEN)
+
+// A boot keyboard sits next to the microphone so the device can start dictation
+// in the host application instead of waiting for a mouse click. Interface
+// numbers follow the audio function, which owns ITF_NUM_TOTAL interfaces.
+#define ITF_NUM_HID            ITF_NUM_TOTAL
+#define ITF_NUM_ALL            (ITF_NUM_TOTAL + 1)
+
+#define CONFIG_TOTAL_LEN        (TUD_CONFIG_DESC_LEN + CFG_TUD_AUDIO * TUD_AUDIO_DEVICE_DESC_LEN + TUD_HID_DESC_LEN)
 #define EPNUM_AUDIO_OUT   0x01
 #define EPNUM_AUDIO_FB    0x81
 #define EPNUM_AUDIO_IN    0x82
+#define EPNUM_HID_IN      0x83
+
+// Boot keyboard with a 1-byte LED output report. The output byte is unused for
+// now but keeps a host-to-device channel available without a driver.
+static uint8_t const desc_hid_report[] = {
+    0x05, 0x01,        // Usage Page (Generic Desktop)
+    0x09, 0x06,        // Usage (Keyboard)
+    0xA1, 0x01,        // Collection (Application)
+    0x05, 0x07,        //   Usage Page (Key Codes)
+    0x19, 0xE0,        //   Usage Minimum (224)
+    0x29, 0xE7,        //   Usage Maximum (231)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x25, 0x01,        //   Logical Maximum (1)
+    0x75, 0x01,        //   Report Size (1)
+    0x95, 0x08,        //   Report Count (8)
+    0x81, 0x02,        //   Input (Data, Variable, Absolute) - modifier byte
+    0x95, 0x01,        //   Report Count (1)
+    0x75, 0x08,        //   Report Size (8)
+    0x81, 0x01,        //   Input (Constant) - reserved byte
+    0x95, 0x05,        //   Report Count (5)
+    0x75, 0x01,        //   Report Size (1)
+    0x05, 0x08,        //   Usage Page (LEDs)
+    0x19, 0x01,        //   Usage Minimum (1)
+    0x29, 0x05,        //   Usage Maximum (5)
+    0x91, 0x02,        //   Output (Data, Variable, Absolute) - LED report
+    0x95, 0x01,        //   Report Count (1)
+    0x75, 0x03,        //   Report Size (3)
+    0x91, 0x01,        //   Output (Constant) - LED padding
+    0x95, 0x06,        //   Report Count (6)
+    0x75, 0x08,        //   Report Size (8)
+    0x15, 0x00,        //   Logical Minimum (0)
+    0x25, 0x65,        //   Logical Maximum (101)
+    0x05, 0x07,        //   Usage Page (Key Codes)
+    0x19, 0x00,        //   Usage Minimum (0)
+    0x29, 0x65,        //   Usage Maximum (101)
+    0x81, 0x00,        //   Input (Data, Array) - key array
+    0xC0               // End Collection
+};
 
 uint8_t const desc_configuration[] = {
     // Config number, interface count, string index, total length, attribute, power in mA
-    TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_TOTAL, 0, CONFIG_TOTAL_LEN, 0x00, 100),
+    TUD_CONFIG_DESCRIPTOR(1, ITF_NUM_ALL, 0, CONFIG_TOTAL_LEN, 0x00, 100),
     // Interface number, string index, EP Out & EP In address, EP size
     TUD_AUDIO_DESCRIPTOR(ITF_NUM_AUDIO_CONTROL, 4, EPNUM_AUDIO_OUT, EPNUM_AUDIO_IN, EPNUM_AUDIO_FB),
+    // Interface number, string index (0 = none), protocol, report length, EP In, size, polling ms
+    TUD_HID_DESCRIPTOR(ITF_NUM_HID, 0, HID_ITF_PROTOCOL_KEYBOARD, sizeof(desc_hid_report),
+                       EPNUM_HID_IN, 8, 5),
 };
+
+//--------------------------------------------------------------------+
+// HID callbacks
+//--------------------------------------------------------------------+
+
+uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance)
+{
+    (void)instance;
+    return desc_hid_report;
+}
+
+uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
+                               hid_report_type_t report_type, uint8_t *buffer,
+                               uint16_t reqlen)
+{
+    // Only the keyboard report is defined, and the host never reads it back.
+    (void)instance;
+    (void)report_id;
+    (void)report_type;
+    (void)buffer;
+    (void)reqlen;
+    return 0;
+}
+
+void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
+                           hid_report_type_t report_type, uint8_t const *buffer,
+                           uint16_t bufsize)
+{
+    // LED state from the host. Unused today; kept so the interface stays a plain
+    // boot keyboard and Windows installs no extra driver.
+    (void)instance;
+    (void)report_id;
+    (void)report_type;
+    (void)buffer;
+    (void)bufsize;
+}
+
 
 // Invoked when received GET CONFIGURATION DESCRIPTOR
 // Application return pointer to descriptor

@@ -22,8 +22,8 @@ typedef struct
     device_screen_mode_t mode;
     bool usb_connected;
     bool audio_ready;
-    bool recording;
-    bool muted;
+    bool recording;      // Host has an open capture stream.
+    bool listening;       // Push-to-talk is holding the microphone open.
     bool charging;
     int battery_percent; // -1 means unavailable.
     int gain_db;

@@ -15,7 +15,12 @@ esp_err_t box2_audio_init_with_sample_rate(i2c_master_bus_handle_t i2c_bus,
                                            uint32_t sample_rate);
 esp_err_t box2_audio_set_output_volume(int volume_percent);
 esp_err_t box2_audio_set_input_gain(float gain_db);
-esp_err_t box2_audio_write(const int16_t *samples, size_t sample_count);
+/**
+ * Play back interleaved stereo frames: [L0, R0, L1, R1, ...].
+ * The TX slot runs stereo so the ES8389 DAC reference stays valid; feed the
+ * same sample to both channels for a centred mono cue.
+ */
+esp_err_t box2_audio_write(const int16_t *stereo_frames, size_t frame_count);
 esp_err_t box2_audio_read(int16_t *samples, size_t sample_count);
 /** Return the initialized sample rate, or zero before successful initialization. */
 uint32_t box2_audio_sample_rate(void);

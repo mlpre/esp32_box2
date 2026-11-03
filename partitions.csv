@@ -1,0 +1,10 @@
+﻿# BOX2 USB microphone with on-device wake word.
+# 16 MB flash. The factory app grew past the 1 MB SINGLE_APP default once
+# esp-sr + esp-dl were linked in, and the wake word model needs its own region.
+# nvs/phy_init keep their stock offsets so an existing device keeps its
+# saved USB mode when this table is flashed.
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xf000,   0x1000,
+factory,    app,  factory,  0x10000,  0x400000,
+model,      data, spiffs,   0x410000, 0x400000,

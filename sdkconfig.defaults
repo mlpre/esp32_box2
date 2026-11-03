@@ -17,3 +17,14 @@ CONFIG_UAC_TINYUSB_TASK_PRIORITY=6
 CONFIG_UAC_MIC_TASK_PRIORITY=5
 CONFIG_UAC_TUSB_PRODUCT="BOX2 Microphone"
 CONFIG_UAC_TUSB_MANUFACTURER="BOX2"
+
+# On-device wake word. esp-sr needs a dedicated "model" partition, which is why
+# the project switched off the 1 MB SINGLE_APP table. Models are read from flash
+# (mmap) instead of being copied into RAM; NS/VAD stay on the cheap WebRTC
+# implementations because the deep models cost PSRAM and CPU we need for USB.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_MODEL_IN_FLASH=y
+CONFIG_SR_WN_WN10_HILEXIN_INT16=y
+CONFIG_SR_NSN_WEBRTC=y
+CONFIG_SR_VADN_WEBRTC=y
